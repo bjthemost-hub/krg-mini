@@ -175,3 +175,95 @@ Environment: 3 physical servers (2x12-core Xeon E5-2650 v4, 48 threads, 62.8 GiB
 each; one of them 31.3 GiB), 12 VirtualBox VMs of 2 vCPU / 1.9 GiB spread over
 three of the servers, Ubuntu 22.04.5, kernels 5.15.0-119/131/198. One server per
 rig means the VMs and the head node share silicon on the 12-VM and cluster runs.
+
+## Throughput: 20 nodes, 5 hosts x 4 VMs (2026-10-27)
+
+The 15-node rig above mixes three physical servers with 12 VMs, and the servers were
+*themselves* cluster nodes — 168 workers on 144 physical threads. So its per-thread
+figure (0.26) mostly measured oversubscription, not the cluster layer. The rig below
+is the topology the project now runs on: **every node is a VM, physical boxes only
+host them.**
+
+| item | value |
+|---|---|
+| nodes | 20 VMs, 4 per host, spread over 5 hosts |
+| per node | 2 vCPU, 2 GiB, Ubuntu 22.04.5, kernel 5.15.0-198 |
+| total vCPU | 40 |
+| coordinator | a separate ARM box (12 cores) that hashes nothing and is not a node |
+| workload | `krg-crack --zeros 12 --budget 2000000000`, 2 workers per node |
+
+### How the rig is built
+
+Five identical 2x12-core servers, each running four VirtualBox guests (2 vCPU, 2 GiB,
+one shared Ubuntu image). Every guest gets its own `node_id` via `deploy/install.sh`,
+`krg-mini.service` starts `krgtool serve 7700`, the host maps four local ports to the
+four guests, and all 20 nodes carry the same 20-line `/etc/krg-nodes.list`.
+
+The hosts are **not** nodes: their own `krg-mini` is stopped and disabled, so the
+whole compute budget is 40 vCPU and no host is oversubscribed (8 vCPU on a 48-thread
+server). The coordinator is a separate 12-core ARM board on the same switch — it
+holds the node list and the chunk queue, and hashes nothing.
+
+Three runs, same 2 G of work each (the coordinator counts in 1M-nonce chunks, so the
+last chunk can overshoot by up to one chunk):
+
+| run | counted | wall | rate | settle |
+|---|---|---|---|---|
+| 1 | 2,000,000,000 | 78.23 s | 25.6 MHash/s | 0.39 s |
+| 2 | 2,000,000,000 | 78.78 s | 25.4 MHash/s | 0.64 s |
+| 3 | 2,001,000,000 | 78.71 s | 25.4 MHash/s | 0.44 s |
+| **median** | | | **25.4 MHash/s** | |
+
+Per thread that is 0.635 MHash/s (25.4 / 40).
+
+### Same loop, no cluster layer
+
+`raw_sha.py` on one of the hosts (2x12-core Xeon E5-2650 v4, SMT on, 48 threads):
+
+| processes | work | wall | rate | per process |
+|---|---|---|---|---|
+| 8 | 400 M | 61.25 s | 6.5 MHash/s | 0.816 |
+| 20 | 800 M | 49.22 s | 16.3 MHash/s | 0.813 |
+| 40 | 800 M | 42.20 s | 19.0 MHash/s | 0.474 |
+
+### What the numbers say
+
+- **1.56x a single 20-core box**: 25.4 MHash/s against 16.3 MHash/s for 20 bare
+  processes on one server. The cluster's 40 vCPU are spread 8 per host, so no host
+  is oversubscribed.
+- **1.34x a single box running 40 processes** (19.0): past 24 physical cores the box
+  is fighting SMT, per process drops from 0.81 to 0.47, while the cluster still gets
+  0.635 per vCPU.
+- **78% per-thread efficiency** (0.635 vs 0.813 at 20 bare processes). The missing
+  fifth is the coordinator: one Python process, one socket round trip per 1M-hash
+  chunk, plus 20 `exec nproc` probes and 40 `spawn` calls at start.
+- **Fan-out is cheap here**: 0.39 / 0.64 / 0.44 s to start 40 workers on 20 nodes,
+  out of a 78 s run — under 1%. On the 15-node rig it was 4.9 s of 46 s, because
+  that coordinator was itself a worker on an oversubscribed host.
+- **The 15-node 49.2 MHash/s is not comparable**: it is 168 threads, this is 40.
+  Per thread 0.29 vs 0.635 — the difference is the topology, not the code.
+
+![20-node cluster at full load: 20/20 nodes online, 40 cores at 99.8% CPU,
+40 workers](images/krg-top-20nodes.png)
+
+`krg-top` during run 2. Every card is one VM (2 cores at ~100%), `workers 40` is one
+`krg-crack` worker per vCPU, the header line is the whole-cluster average. The board
+is served by the head node, reads every node through `krgtool exec`, and shows a node
+as unreachable when it cannot be reached.
+
+### Reproducing
+
+```sh
+# 20-node list: "name host:7700", one line per VM
+wc -l /etc/krg-nodes.list          # 20
+
+# fixed amount of work, so a lucky hit cannot flatter the number
+krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-per-node 2
+
+# same inner loop, no cluster layer, on one of the hosts
+python3 raw_sha.py 20 40000000     # 20 processes, 800 M hashes total
+```
+
+The screenshot needs no scrubbing: node names are `<host>-<slot>`, and the page shows
+no addresses. Everything else in this document is the same — no hostnames, no IPs,
+no credentials.

@@ -31,7 +31,7 @@ An SSI is four things at once. Here is where this project stands — no more, no
 - [ ] **identity vs location** — `node_id << 24 | pid` is a birth identity only; where it runs now needs a lookup
 - [ ] **placement in the kernel** — new tasks land on the idlest node without anyone asking
 - [ ] **DSM** — an address range visible from every node, with write ownership
-- [ ] scale out to 5 physical hosts + 20 VMs
+- [x] scale out to 5 physical hosts + 20 VMs (4 VMs per host, physical boxes are hosts only)
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
 agree), then a process tree that spans nodes (remote fork with fd/pipe objects
 forwarded), then a paged DSM. Until the last one lands, this is honest to call a
@@ -64,7 +64,7 @@ deploy/install.sh       build + install on one node
 deploy/krg-mini.service systemd unit (modprobe + krgtool serve 7700)
 deploy/krg-nodes.list.example
 docs/DESIGN.md          data structures, wire protocol, coordinator logic
-docs/BENCHMARKS.md      measured numbers on a 13-node setup + how to reproduce
+docs/BENCHMARKS.md      measured numbers on 13-, 15- and 20-node setups + how to reproduce
 ```
 
 ## Requirements
@@ -142,6 +142,7 @@ amount of work so a lucky hit cannot flatter the number.
 | 12 VMs over 3 hosts | 24 | 601 M | 40.3 s | 14.9 MHash/s |
 | one 48-thread server | 48 | 1.00 G | 69.1 s | 14.5 MHash/s |
 | **15-node cluster (3 servers + 12 VMs)** | **168** | **2.00 G** | **46.3 s** | **43.3 MHash/s** |
+| **20-node cluster (5 hosts x 4 VMs, VMs only)** | **40** | **2.00 G** | **78.7 s** | **25.4 MHash/s** |
 
 - The cluster scales: 43.3 MHash/s is **2.4x** what one of those servers does with
   no cluster layer at all (18.3 MHash/s, same loop in bare `fork()`+`hashlib`), and
@@ -158,6 +159,14 @@ amount of work so a lucky hit cannot flatter the number.
   worker nodes and also hosts four VMs, and 49.2 MHash/s (+12.6%) when it is a
   separate ARM box that hashes nothing — fan-out drops from ~4.9 s to ~2 s. What
   the coordinator needs is not being preempted, not a fast core.
+
+- **On the 20-node rig (40 vCPU, no host oversubscribed) the cluster reaches
+  25.4 MHash/s, 1.56x a single box running 20 bare processes (16.3) and 1.34x one
+  running 40 (19.0), at 78% of bare-metal per-thread rate (0.635 vs 0.813).** Fanning
+  out 40 workers there costs 0.4-0.6 s out of a 78 s run. The 15-node 168-thread
+  number is not comparable to it: per thread that rig got 0.29, this one 0.635.
+
+![20-node cluster under full load](docs/images/krg-top-20nodes.png)
 
 Full environment, per-node numbers and the exact commands are in
 `docs/BENCHMARKS.md`.
@@ -204,7 +213,7 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 - [ ] **身份与位置分开** —— `节点号 << 24 | pid` 只当出生身份，跑在哪要另查
 - [ ] **内核里的放置** —— 新任务自动落到最闲的节点
 - [ ] **DSM** —— 一段地址空间多节点可见，写要有归属
-- [ ] 扩到 5 台物理机 + 20 台虚拟机
+- [x] 扩到 5 台物理机 + 20 台虚拟机（2026-10-27：5 台宿主各跑 4 台 VM = 20 个节点，物理机只当宿主）
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
 继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
 第三块落地之前，它只能叫**部分 SSI**。
@@ -228,6 +237,18 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 （而且那台机器还扛着 4 台虚拟机）是中位 43.7 MHash/s；挪到一台**不参与计算**的 ARM 板子上是
 **49.2 MHash/s（+12.6%）**，分发开销从约 4.9 s 降到约 2 s。协调端一个哈希都不算，
 它要的是"不被打断"，不是单核快。
+
+**20 个节点（5 台宿主 × 4 台 VM，物理机只当宿主，共 40 vCPU；协调端在那块 ARM 板子上）**：
+同一份 2 G 工作量跑 3 轮，78.23 / 78.78 / 78.71 s，中位 **25.4 MHash/s**（每线程 0.635）。
+同样的循环去掉集群层、在单台物理机上跑 20 个进程是 16.3 MHash/s（每进程 0.813）——
+**集群是单机 20 核的 1.56 倍**；单机跑 40 个进程是 19.0（每进程 0.474，被 SMT 挤），集群是它的 1.34 倍。
+每线程能到裸机的 78%，差的约五分之一是协调端（一个 Python 进程、每 100 万哈希一次 socket 往返）；
+40 个 worker 的分发只要 0.4–0.6 s，占 78 s 的不到 1%。
+注意 15 节点那组 49.2 是 168 个线程、而且宿主被压过头，不能和这里的 40 线程直接比（每线程 0.29 对 0.635）。
+
+压力测试中的状态面板（`krg-top`，run 2 现场）：
+
+![20 节点集群满负荷](docs/images/krg-top-20nodes.png)
 
 **实时状态面板**（`krg-top`）：一个 HTML 页面显示每台机器的 CPU、内存、负载、内核和 worker 数，
 走 `krgtool exec` 取数，连不上的节点就照实显示连不上。
