@@ -10,6 +10,20 @@ It died with 2.6.30. **krg-mini** keeps the idea and throws away almost everythi
 else: 272 lines of kernel module plus three userspace tools (~1100 lines total),
 built against a stock Ubuntu 22.04 kernel, no patch required.
 
+An SSI is four things at once. Here is where this project stands — no more, no less:
+
+| property | status |
+|---|---|
+| one process space — `ps` / `kill` on any node reaches every task | **yes**: `/dev/krgview` exports each node's table, merged in userspace, global pid = `node_id << 24 \| pid` |
+| a task can be created on any node | **partial**: `SPAWN` starts a process on another node, but it is not part of the caller's process tree |
+| one file system — same path, same bytes everywhere | **no**: `krgsh ls` runs `ls` per node and prints the results side by side |
+| one memory — an address range visible from every node | **no** |
+
+The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
+agree), then a process tree that spans nodes (remote fork with fd/pipe objects
+forwarded), then a paged DSM. Until the last one lands, this is honest to call a
+*partial* SSI.
+
 What actually works today:
 
 | capability | how |
@@ -156,6 +170,18 @@ Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一�
 | 吞吐型负载 | `krg-crack`：SHA-256 原像搜索。worker 从队列里按 100 万个 nonce 一块地领，命中的那块在本地重算一遍再报，防止误报 |
 | 实时状态面板 | `krg-top`：一个 HTML 页面显示每个节点的 CPU / 内存 / 负载 / 内核 / worker 数；数据也是走 `krgtool exec` 取的，连不上的节点直接标成连不上 |
 
+SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
+
+| SSI 的构成 | 现在的状态 |
+|---|---|
+| 单一进程空间（任意节点 `ps` / `kill` 都能碰到所有进程） | **有**：`/dev/krgview` 导出各节点进程表，用户态合并；全局 pid = `节点号 << 24 \| pid` |
+| 任务可以在任意节点上创建 | **部分**：`SPAWN` 能在别的节点起进程，但它不是调用者那棵进程树的一部分 |
+| 单一文件系统（同一路径、同一份数据） | **没有**：`krgsh ls` 是每台各列一遍再拼起来 |
+| 单一内存（一段地址空间多节点可见） | **没有** |
+
+接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
+继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
+第三块落地之前，它只能叫**部分 SSI**。
 **没做的**（也就是 Kerrighed 真正难的那 90%）：进程迁移、分布式共享内存、共享文件系统、
 内核里的全局调度。这里的 `ls` 只是"同一个路径在每台机器各列一遍"，因为节点之间并没有共享文件系统。
 
