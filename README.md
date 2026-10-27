@@ -19,6 +19,19 @@ An SSI is four things at once. Here is where this project stands — no more, no
 | one file system — same path, same bytes everywhere | **no**: `krgsh ls` runs `ls` per node and prints the results side by side |
 | one memory — an address range visible from every node | **no** |
 
+## TODO
+
+- [x] one process table across nodes (`/dev/krgview`, global pid)
+- [x] create / kill a task on another node (`SPAWN` / `KILL`)
+- [x] cluster shell: `free` / `top` merged across every node
+- [x] live status board (`krg-top`, one HTML page)
+- [ ] **one `/krg`** — a shared tree; `ls` and `bash` touch the same bytes on every node (NFS first)
+- [ ] **single-shell cross-node jobs** — the command runs once, a pipeline's stages land on different machines, `Ctrl-C` stops the whole job, exit codes come back
+- [ ] **remote fork** — the child lands on another node and keeps the parent's fds / pipes / sockets (not re-opened by path)
+- [ ] **identity vs location** — `node_id << 24 | pid` is a birth identity only; where it runs now needs a lookup
+- [ ] **placement in the kernel** — new tasks land on the idlest node without anyone asking
+- [ ] **DSM** — an address range visible from every node, with write ownership
+- [ ] scale out to 5 physical hosts + 20 VMs
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
 agree), then a process tree that spans nodes (remote fork with fd/pipe objects
 forwarded), then a paged DSM. Until the last one lands, this is honest to call a
@@ -179,6 +192,19 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 | 单一文件系统（同一路径、同一份数据） | **没有**：`krgsh ls` 是每台各列一遍再拼起来 |
 | 单一内存（一段地址空间多节点可见） | **没有** |
 
+## 待办
+
+- [x] 跨节点进程表（`/dev/krgview`，全局 pid）
+- [x] 在别的节点建 / 杀进程（`SPAWN` / `KILL`）
+- [x] 集群 shell：`free` / `top` 合并整个集群
+- [x] 实时状态面板（`krg-top`，一页 HTML）
+- [ ] **单一 `/krg`** —— 同一棵树，`ls` / `bash` 在每台机器碰到的是同一份字节（先上 NFS）
+- [ ] **单 shell 的跨节点作业** —— 一条命令只执行一次，管道各段落在不同机器上，`Ctrl-C` 能停整条作业，退出码能回来
+- [ ] **远程 fork** —— 子进程落到别的节点，并且保留父进程的 fd / 管道 / socket（不是按路径重新打开）
+- [ ] **身份与位置分开** —— `节点号 << 24 | pid` 只当出生身份，跑在哪要另查
+- [ ] **内核里的放置** —— 新任务自动落到最闲的节点
+- [ ] **DSM** —— 一段地址空间多节点可见，写要有归属
+- [ ] 扩到 5 台物理机 + 20 台虚拟机
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
 继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
 第三块落地之前，它只能叫**部分 SSI**。
