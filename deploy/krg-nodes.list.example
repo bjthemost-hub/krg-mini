@@ -1,0 +1,10 @@
+# Cluster members: <name> <host:port of that node's `krgtool serve`>.
+# Copy to /etc/krg-nodes.list on every node that will run krgsh or krg-pi.
+# Add a machine by appending one line; keep the names short (they are the
+# column values printed by `krgsh top` / `krgsh free`).
+#
+#  name    address
+head1     10.0.7.11:7700
+work1     10.0.7.21:7700
+work2     10.0.7.22:7700
+work3     10.0.7.23:7700

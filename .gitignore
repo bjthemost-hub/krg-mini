@@ -1,0 +1,13 @@
+# build products
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+user/krgtool
+
+# python
+__pycache__/
+*.pyc
