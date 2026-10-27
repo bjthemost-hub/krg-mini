@@ -126,6 +126,11 @@ amount of work so a lucky hit cannot flatter the number.
   are 24 physical cores with SMT, and CPython's SHA-256 gains almost nothing from
   the sibling thread.
 - Fanning out 168 workers across 15 nodes costs 4.9 s of the 46 s run.
+- **Where the coordinator runs matters more than its clock speed.** The same 2 G
+  of work takes 43.7 MHash/s (median of 3) when the coordinator is one of the
+  worker nodes and also hosts four VMs, and 49.2 MHash/s (+12.6%) when it is a
+  separate ARM box that hashes nothing — fan-out drops from ~4.9 s to ~2 s. What
+  the coordinator needs is not being preempted, not a fast core.
 
 Full environment, per-node numbers and the exact commands are in
 `docs/BENCHMARKS.md`.
@@ -166,6 +171,11 @@ Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一�
 是单台物理机**裸机**（18.3）的 2.4 倍、单虚拟机的 33 倍。
 但每线程只有 0.26（裸机 0.38，约 68%）：**扩出来的收益来自核数，不是来自 SSI**，
 协调端是单个 Python 进程，168 个 worker 的分发本身要 4.9 s。
+
+**协调端放在哪儿，比它跑多快更重要**：同一份 2 G 工作量，协调端和 worker 挤在同一台机器上
+（而且那台机器还扛着 4 台虚拟机）是中位 43.7 MHash/s；挪到一台**不参与计算**的 ARM 板子上是
+**49.2 MHash/s（+12.6%）**，分发开销从约 4.9 s 降到约 2 s。协调端一个哈希都不算，
+它要的是"不被打断"，不是单核快。
 
 **实时状态面板**（`krg-top`）：一个 HTML 页面显示每台机器的 CPU、内存、负载、内核和 worker 数，
 走 `krgtool exec` 取数，连不上的节点就照实显示连不上。

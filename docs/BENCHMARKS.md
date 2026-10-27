@@ -151,6 +151,26 @@ after 8.21 G hashes in 179 s; server B after 573 M in 39.7 s; server A ran 5.67 
 in 6 m 49 s without a hit and was aborted. A single random search is a bad timer —
 use the fixed-budget rates above, and treat these as "it does finish".
 
+## Where the coordinator runs (2026-10-27, 15 nodes, 2 G hashes each)
+
+Same cluster, same `--zeros 12 --budget 2000000000 --workers-per-node 64`. The
+only variable is which machine runs the coordinator. Three runs each:
+
+| coordinator | runs (MHash/s) | median | fan-out (spawn) |
+|---|---|---|---|
+| a worker node, and the host of four VMs | 43.3 / 43.7 / 44.0 | **43.7** | 4.53 / 4.93 / 6.88 s |
+| a separate ARM box (Jetson Orin, 12 cores, coordinator only) | 49.2 / 46.2 / 49.3 | **49.2** | 1.48 / 2.84 s |
+
+Moving the coordinator off the busy machine is worth **+12.6%** (43.7 -> 49.2
+MHash/s) and cuts fan-out from ~4.9 s to ~2 s, even though that box's single core
+is slower than one Xeon core. The coordinator hashes nothing; what it needs is
+not being preempted, not raw single-core speed.
+
+This also qualifies the 0.26-per-thread row above: most of that gap is the head
+node competing with its own four VMs, not the cluster layer. With a dedicated
+coordinator the cluster runs at 0.29 MHash/s per thread against 0.38 on bare
+metal (~77%), so 168 threads reach 49.2 MHash/s — 2.7x one 48-thread server with
+no cluster layer at all.
 Environment: 3 physical servers (2x12-core Xeon E5-2650 v4, 48 threads, 62.8 GiB
 each; one of them 31.3 GiB), 12 VirtualBox VMs of 2 vCPU / 1.9 GiB spread over
 three of the servers, Ubuntu 22.04.5, kernels 5.15.0-119/131/198. One server per
