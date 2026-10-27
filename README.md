@@ -65,6 +65,7 @@ deploy/krg-mini.service systemd unit (modprobe + krgtool serve 7700)
 deploy/krg-nodes.list.example
 docs/DESIGN.md          data structures, wire protocol, coordinator logic
 docs/BENCHMARKS.md      measured numbers on 13-, 15- and 20-node setups + how to reproduce
+docs/REPORT_2026-10-27_20nodes.md  the 20-node round as a standalone report (method, numbers, limits, raw log)
 ```
 
 ## Requirements
