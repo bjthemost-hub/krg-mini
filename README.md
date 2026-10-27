@@ -10,7 +10,8 @@ It died with 2.6.30. **krg-mini** keeps the idea and throws away almost everythi
 else: 272 lines of kernel module plus three userspace tools (~1100 lines total),
 built against a stock Ubuntu 22.04 kernel, no patch required.
 
-An SSI is four things at once. Here is where this project stands — no more, no less:
+An SSI is four things at once. Here is where this project stands — no more, no less
+(full statement, with the code each row is checked against: [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-MACHINE.md)):
 
 | property | status |
 |---|---|
@@ -18,6 +19,10 @@ An SSI is four things at once. Here is where this project stands — no more, no
 | a task can be created on any node | **partial**: `SPAWN` starts a process on another node, but it is not part of the caller's process tree |
 | one file system — same path, same bytes everywhere | **no**: `krgsh ls` runs `ls` per node and prints the results side by side |
 | one memory — an address range visible from every node | **no** |
+
+**Target release khz v0.1**: properties 1–3 above — one process space, one CPU, one
+memory — each with an acceptance test anyone can rerun. One file system is explicitly
+out of scope for v0.1. Criteria: [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-MACHINE.md).
 
 ## TODO
 
@@ -29,8 +34,8 @@ An SSI is four things at once. Here is where this project stands — no more, no
 - [ ] **single-shell cross-node jobs** — the command runs once, a pipeline's stages land on different machines, `Ctrl-C` stops the whole job, exit codes come back
 - [ ] **remote fork** — the child lands on another node and keeps the parent's fds / pipes / sockets (not re-opened by path)
 - [ ] **identity vs location** — `node_id << 24 | pid` is a birth identity only; where it runs now needs a lookup
-- [ ] **placement in the kernel** — new tasks land on the idlest node without anyone asking
-- [ ] **DSM** — an address range visible from every node, with write ownership
+- [ ] **placement in the kernel** — new tasks land on the idlest node without anyone asking (**khz v0.1**)
+- [ ] **DSM** — an address range visible from every node, with write ownership (**khz v0.1**)
 - [x] scale out to 5 physical hosts + 20 VMs (4 VMs per host, physical boxes are hosts only)
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
 agree), then a process tree that spans nodes (remote fork with fd/pipe objects
@@ -64,6 +69,7 @@ deploy/install.sh       build + install on one node
 deploy/krg-mini.service systemd unit (modprobe + krgtool serve 7700)
 deploy/krg-nodes.list.example
 docs/DESIGN.md          data structures, wire protocol, coordinator logic
+docs/WHAT-IS-ONE-MACHINE.md  the four SSI properties, one by one, with what is real and what is only displayed
 docs/BENCHMARKS.md      measured numbers on 13-, 15- and 20-node setups + how to reproduce
 docs/REPORT_2026-10-27_20nodes.md  the 20-node round as a standalone report (method, numbers, limits, raw log)
 ```
@@ -202,6 +208,10 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 | 单一文件系统（同一路径、同一份数据） | **没有**：`krgsh ls` 是每台各列一遍再拼起来 |
 | 单一内存（一段地址空间多节点可见） | **没有** |
 
+下一个版本的名称定为 **khz v0.1**：上面第 1–3 条（单一进程空间 / 一块 CPU / 一大片内存）都要落地，
+每条都带一个别人能重跑的验收测试；**单一文件系统明确不在 v0.1 范围内**。
+逐条判定依据与验收标准写在 [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-MACHINE.md)。
+
 ## 待办
 
 - [x] 跨节点进程表（`/dev/krgview`，全局 pid）
@@ -212,8 +222,8 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 - [ ] **单 shell 的跨节点作业** —— 一条命令只执行一次，管道各段落在不同机器上，`Ctrl-C` 能停整条作业，退出码能回来
 - [ ] **远程 fork** —— 子进程落到别的节点，并且保留父进程的 fd / 管道 / socket（不是按路径重新打开）
 - [ ] **身份与位置分开** —— `节点号 << 24 | pid` 只当出生身份，跑在哪要另查
-- [ ] **内核里的放置** —— 新任务自动落到最闲的节点
-- [ ] **DSM** —— 一段地址空间多节点可见，写要有归属
+- [ ] **内核里的放置** —— 新任务自动落到最闲的节点（**khz v0.1**）
+- [ ] **DSM** —— 一段地址空间多节点可见，写要有归属（**khz v0.1**）
 - [x] 扩到 5 台物理机 + 20 台虚拟机（2026-10-27：5 台宿主各跑 4 台 VM = 20 个节点，物理机只当宿主）
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
 继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
