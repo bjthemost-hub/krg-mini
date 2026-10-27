@@ -11,7 +11,7 @@ usually *claimed* — and in the order they are actually hard.
 |---|---|---|---|---|
 | 1 | **one process space** | `ps` on any node lists every task in the cluster; `kill <pid>` works from anywhere | each node exports its task table through `/dev/krgview`; userspace merges them; every task carries a global pid = `node_id << 24 \| pid` | **implemented** |
 | 2 | **one CPU** | one run queue, one scheduler; a new task lands on the least loaded core of the whole cluster without anyone choosing | a sum for display; `krg-pi` picks in userspace; **since v0.1 the kernel itself places `SPAWN`ed tasks and reserves the target** — but ordinary `fork`/`exec` still lands locally and nothing rebalances | **partial** |
-| 3 | **one memory** | an address range allocated on node A can be read and written from node B, coherently | sums `MemTotal` / `MemFree` per node and prints one "cluster" line | **not implemented** |
+| 3 | **one memory** | an address range allocated on node A can be read and written from node B, coherently | named segments in `/dev/krgdsm`; pages cost memory only when touched; a reader pulls pages and can hold a bounded cache, so it reads a segment far bigger than its own RAM. Explicit read/write calls, no shared address space, no write coherence | **partial** |
 | 4 | **one file system** | the same path resolves to the same bytes everywhere | `krgsh ls` runs `ls` on every node and prints the results side by side | **not implemented** |
 
 ## 1. One process space — implemented
@@ -52,17 +52,52 @@ is already running.
 So the honest sentence is: **the cluster reports one CPU; the kernel now places new
 `SPAWN`ed tasks across nodes, but there is still no shared run queue.**
 
-## 3. One memory — not implemented
+## 3. One memory — partial: a paged segment pulled on demand
 
-`krgsh free` prints a `cluster` line whose total is the arithmetic sum of every node's
-`MemTotal`, and used is the sum of the per-node used values (`krgsh.py:128-135`).
+`krgsh free` still prints a `cluster` line whose total is the arithmetic sum of every
+node's `MemTotal` (`krgsh.py:128-135`). That part is accounting only, and on its own it
+would be the same lie as before.
 
-That is accounting, not memory. A process on node A cannot name, map, read or write a
-byte that lives on node B. There is no shared address space, no page ownership, no
-fault forwarding, no coherence protocol. Nothing in the tree would be able to serve a
-page fault for a page that is resident elsewhere.
+What changed is `/dev/krgdsm` (`module/krg_dsm.c`) plus `krgdsm` (`user/krgdsm.py`):
 
-So the honest sentence is: **the cluster reports one big memory; it does not have one.**
+- A segment is a **name plus page slots**, not a block of pages. `ALLOC` reserves the
+  slots; a page costs memory only once someone writes it. A 1 GiB segment that is
+  never written costs a page table and nothing else.
+- The **home** node writes pages and seals the segment. Any other node `ALLOC`s the
+  same name and pulls the pages it wants through the cluster's existing channel
+  (`DSMGET <name> <first> <count>`, up to 64 pages per request).
+- A reader can give itself a **bounded cache** (`krgdsm alloc NAME PAGES --cache N`).
+  Pulling page N+1 evicts the oldest one, so the node never holds more than N pages,
+  and it can read a segment many times its own free memory.
+
+Measured on 2026-10-27, two 2 GiB VMs (`krg11-1` = node 2 home, `krg11-2` = node 3
+reader), segment `pool` = 65 536 pages = 256 MiB:
+
+| | result |
+|---|---|
+| home: slots reserved | 65 536 (no memory taken) |
+| home: pages written | 65 536, `used` 220 MB -> 477 MB (+257 MB = 256 MiB of pages) |
+| reader: cache | 64 pages (256 KiB) |
+| reader: read all 256 MiB, 3 runs | 32.2 / 31.3 / 35.5 MiB/s, 110-125 us/page, **0 content mismatches** |
+| reader: peak resident | **64 pages = 0.2 MiB**, `used` 186 MB -> 184 MB (no growth) |
+
+Reading a page that is not resident returns `ENODATA` rather than zeros, and writing to
+a cache segment returns `EPERM`: a reader's copies are read-only, so the home node can
+never lose data it owns.
+
+Batching mattered more than the network did. On a 256-page segment, one request per
+page cost 1550-1970 us/page (2.0-2.5 MiB/s); 64 pages per request cost 146-150 us/page
+(26.1-26.8 MiB/s) on the same two nodes. Most of the old cost was per-request overhead,
+not bytes on the wire.
+
+What does not exist: **a shared address space**. A program calls read and write; it
+cannot take the address of a byte and touch it. There is no fault path that fetches a
+page into a mapping, no write ownership, no coherence protocol, no invalidation, and
+exactly one home per segment -- pages cannot be spread across several nodes yet.
+
+So the honest sentence is: **a named range now really does live across nodes, and a
+node can use a range much larger than its own memory -- but only through an explicit
+API, and only read-only for the far side.**
 
 ## 4. One file system — not implemented
 
@@ -87,7 +122,7 @@ not by dates:
 |---|---|
 | one process space | `ps`/`kill` from any node reaches every task; already passing |
 | one CPU | a task created on any node is placed by one policy covering all nodes, and the placement decision is visible from every node — no per-node choice by the caller |
-| one memory | allocate on node A, read and write the same bytes from node B, with the write visible to A; the test does not go through a file or a socket |
+| one memory | allocate on node A, read the same bytes from node B, with a **bounded cache** on B so the test proves capacity and not just reachability; the test does not go through a file or a socket. *(reachability + capacity: passing; write-back to A: not yet)* |
 | (file system) | **not in v0.1** — stays a known gap, documented here |
 
 Property 4 (one file system) is explicitly **out of scope for v0.1**. The `/krg` tree
@@ -104,11 +139,26 @@ SSI 是四条性质，下面按"通常被声称的顺序"、也是"实际难度�
 |---|---|---|---|---|
 | 1 | 单一进程空间 | 任意节点 `ps` 能看到全集群的进程，`kill` 跨节点有效 | 每节点通过 `/dev/krgview` 导出任务表，用户态合并，全局 pid = `节点号 << 24 \| pid` | **已实现** |
 | 2 | 一块 CPU | 一个运行队列、一个调度器；新任务自动落到全集群最闲的核上，不需要调用方挑 | 只是把各节点 `nproc` / 负载**加起来显示**；`krg-pi` 是**用户态**先挑节点再起进程 | **未实现** |
-| 3 | 一大片内存 | 在 A 节点分配的一段地址，B 节点能读能写，且 A 能看到 | 把各节点 `MemTotal` / `MemFree` **相加**打印一行 "cluster" | **未实现** |
+| 3 | 一大片内存 | 在 A 节点分配的一段地址，B 节点能读能写，且 A 能看到 | 有了命名段 `/dev/krgdsm`：页按需才占内存，读端可以给自己设**有上限的缓存**，所以能读比自身内存大得多的段；但走的是显式 read/write 调用，不是共享地址空间，远端只读 | **部分** |
 | 4 | 单一文件系统 | 同一个路径在每台机器上是同一份字节 | `krgsh ls` 在每台机器各跑一遍 `ls`，结果并排打印 | **未实现** |
 
-**一句话**：现在是"**一个进程表 + 一堆各自算的机器**"。CPU 和内存只是汇总显示，不是共享 ——
-集群"报告"了一块 CPU 和一大片内存，但它并不"拥有"这两样东西。
+**一句话**：现在是"**一个进程表 + 一个新任务的内核放置 + 一块按页拉取的共享内存**"；
+`free` 里那行 "cluster" 仍然是各节点相加，那一部分是账，不是内存。
+
+#### 内存这条到底改了什么（2026-10-27 实测，两台 2 GiB 虚拟机）
+
+段 `pool` = 65 536 页 = 256 MiB，home 在 node 2，读端在 node 3：
+
+- home：先只占**槽位**，写一页才占一页；写满 65 536 页后 `used` 从 220 MB 涨到 477 MB（+257 MB，即 256 MiB 页）。
+- 读端：`--cache 64`（256 KiB），把 256 MiB 全文读一遍三次，32.2 / 31.3 / 35.5 MiB/s，110–125 µs/页，**内容零错**。
+- 读端**峰值驻留 64 页 = 0.2 MiB**，`used` 186 MB → 184 MB（没长）。也就是说它用 256 KiB 读了 256 MiB。
+- 读到不在本地的页返回 `ENODATA`（不是零），往缓存段写返回 `EPERM` —— 读端的副本只读，home 的数据不会被覆盖。
+
+批量比网络更值钱：同一个 256 页的段，一页一次请求是 1550–1970 µs/页（2.0–2.5 MiB/s），
+一次 64 页是 146–150 µs/页（26.1–26.8 MiB/s）。大部分开销在每次请求本身，不在线上字节。
+
+**还没有的**：共享地址空间（程序只能调 read/write，不能取地址直接读写）、缺页处理、写归属与一致性协议、
+一个段只能有一个 home（页还不能分散到多个节点）。
 
 `/dev/krgview` 里的 pid 只说明**出生在哪个节点**，不说明现在跑在哪（目前也没有迁移）。
 
@@ -127,7 +177,7 @@ SSI 项目真正有意思的地方，就是这四条声称之间的差距。把�
 |---|---|
 | 单一进程空间 | 任意节点 `ps` / `kill` 覆盖全部任务（已达到） |
 | 一块 CPU | 在任意节点创建的任务，由**一个覆盖全集群的策略**决定落点，且这个决定在每个节点都看得到；不由调用方逐节点挑 |
-| 一大片内存 | 在 A 节点分配，在 B 节点读写同一段字节，写回对 A 可见；测试**不经过文件、不经过 socket** |
+| 一大片内存 | 在 A 节点分配，B 节点读同一段字节，且 B 节点带**有上限的缓存**（证明的是容量，不只是可达）；测试**不经过文件**。*(可达 + 容量：已通过；写回对 A 可见：还没做)* |
 | （单一文件系统） | **不进 v0.1**，作为已知缺口留在本文档里 |
 
 第 4 条（单一文件系统）明确不在 v0.1 范围内，`/krg` 放在这之后做。

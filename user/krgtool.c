@@ -60,6 +60,41 @@ struct krgv_state {
 #define KRGV_IOC_RELEASE	_IOW(KRGV_IOC_MAGIC, 2, unsigned)
 #define KRGV_IOC_STATE		_IOR(KRGV_IOC_MAGIC, 3, struct krgv_state)
 
+/* ---- shared segments, mirrored from module/krg_dsm.c -------------------- */
+
+#define DSM_DEV		"/dev/krgdsm"
+#define DSM_NAME	32
+
+struct krgdsm_io {
+	char name[DSM_NAME];
+	unsigned pages, page, off, len;
+	unsigned long buf;
+	unsigned sealed, present, fetched, flags;
+	unsigned cache, resident;
+};
+
+#define KRGDSM_IOC_MAGIC	'D'
+#define KRGDSM_IOC_READ		_IOWR(KRGDSM_IOC_MAGIC, 3, struct krgdsm_io)
+
+static int dsm_read_page(const char *name, unsigned page, void *buf, unsigned len)
+{
+	struct krgdsm_io io;
+	int fd, ret;
+
+	memset(&io, 0, sizeof(io));
+	snprintf(io.name, sizeof(io.name), "%s", name);
+	io.page = page;
+	io.len = len;
+	io.buf = (unsigned long)buf;
+
+	fd = open(DSM_DEV, O_RDWR);
+	if (fd < 0)
+		return -1;
+	ret = ioctl(fd, KRGDSM_IOC_READ, &io);
+	close(fd);
+	return ret;
+}
+
 static const char *st_name(unsigned s)
 {
 	switch (s & 0xff) {
@@ -625,6 +660,38 @@ static void serve(int port)
 				pclose(pp);
 				write(fd, "END\n", 4);
 			}
+		} else if (!strncmp(req, "DSMGET ", 7)) {
+			char name[DSM_NAME];
+			unsigned page, cnt = 1, i;
+			static char bulk[64 * 4096];
+			char hdr[32];
+			int len, ok = 1;
+
+			if (sscanf(req + 7, "%31s %u %u", name, &page, &cnt) < 2) {
+				write(fd, "ERR parse\n", 10);
+			} else {
+				if (!cnt)
+					cnt = 1;
+				if (cnt > 64)
+					cnt = 64;
+				for (i = 0; i < cnt; i++) {
+					if (dsm_read_page(name, page + i,
+							  bulk + i * 4096, 4096)) {
+						ok = 0;
+						break;
+					}
+				}
+				if (!ok) {
+					len = snprintf(hdr, sizeof(hdr), "ERR %d\n", errno);
+					write(fd, hdr, len);
+					goto dsm_done;
+				}
+				len = snprintf(hdr, sizeof(hdr), "OK %u\n", cnt * 4096u);
+				write(fd, hdr, len);
+				write(fd, bulk, cnt * 4096u);
+			}
+dsm_done:
+			;
 		} else if (!strncmp(req, "SPAWN ", 6) ||
 			   !strncmp(req, "KILL ", 5)) {
 			int err = local_write_cmd(req, strlen(req));

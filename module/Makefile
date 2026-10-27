@@ -1,4 +1,5 @@
 obj-m += krg_taskview.o
+obj-m += krg_dsm.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
