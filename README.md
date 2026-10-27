@@ -4,6 +4,24 @@
 > (OpenAI Codex) and a human maintainer; every change was compiled, installed and
 > measured on real machines. See [AI disclosure](#ai-disclosure).
 
+## At a glance — cluster vs one box (measured 2026-10-27)
+
+| setup | compute it uses | throughput | per unit |
+|---|---|---|---|
+| one box, 20 processes | 20 procs on 24 cores / 48 threads | 16.3 MHash/s | **0.813** per process |
+| one box, 40 processes | 40 procs, same box | 19.0 MHash/s | **0.474** per process |
+| one box, 48 processes (one per thread, packed) | 48 procs, same box | 17.5 MHash/s | **0.364** per process |
+| **20-node cluster** | **40 vCPU** (5 hosts x 4 VMs) | **25.4 MHash/s** | **0.635** per vCPU |
+| **40-node cluster** | **80 vCPU** (5 hosts x 8 VMs) | **49.2 MHash/s** | **0.615** per vCPU |
+
+Same workload in every row: SHA-256 preimage search. Cluster rows are a fixed 2 G-hash
+budget, median of 3; the one-box rows are the same inner loop with no cluster layer at
+all. **The cluster is 2.63x that box at 40 processes and 2.81x at 48** — the gain is not
+anything being shared, it is not being squeezed onto 24 physical cores. Details:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) ·
+[20-node report](docs/REPORT_2026-10-27_20nodes.md) ·
+[40-node report](docs/REPORT_2026-10-27_40nodes.md)
+
 Kerrighed was a Single System Image (SSI) cluster: many Linux boxes that look like
 one machine — one process table, one memory, one scheduler, live process migration.
 It died with 2.6.30. **krg-mini** keeps the idea and throws away almost everything
@@ -70,8 +88,9 @@ deploy/krg-mini.service systemd unit (modprobe + krgtool serve 7700)
 deploy/krg-nodes.list.example
 docs/DESIGN.md          data structures, wire protocol, coordinator logic
 docs/WHAT-IS-ONE-MACHINE.md  the four SSI properties, one by one, with what is real and what is only displayed
-docs/BENCHMARKS.md      measured numbers on 13-, 15- and 20-node setups + how to reproduce
+docs/BENCHMARKS.md      measured numbers on 13-, 15-, 20- and 40-node setups + how to reproduce
 docs/REPORT_2026-10-27_20nodes.md  the 20-node round as a standalone report (method, numbers, limits, raw log)
+docs/REPORT_2026-10-27_40nodes.md  the 40-node round + the 20 -> 40 scaling comparison
 ```
 
 ## Requirements
@@ -136,7 +155,7 @@ either: 4.8 s of every run is the serial Machin self-check and 2.3 s is the
 start-up term of the last shard. See `docs/BENCHMARKS.md` for the breakdown;
 the sharding scheme is the obvious thing to fix.
 
-## Measured throughput (2026-10-27, 15 nodes)
+## Measured throughput (2026-10-27, 15 / 20 / 40 nodes)
 
 `pi` is a latency workload and loses to one VM, so the second workload is pure
 throughput: `krg-crack` searches a SHA-256 hash prefix of 12 hex zeros, in
@@ -150,6 +169,7 @@ amount of work so a lucky hit cannot flatter the number.
 | one 48-thread server | 48 | 1.00 G | 69.1 s | 14.5 MHash/s |
 | **15-node cluster (3 servers + 12 VMs)** | **168** | **2.00 G** | **46.3 s** | **43.3 MHash/s** |
 | **20-node cluster (5 hosts x 4 VMs, VMs only)** | **40** | **2.00 G** | **78.7 s** | **25.4 MHash/s** |
+| **40-node cluster (5 hosts x 8 VMs, VMs only)** | **80** | **2.00 G** | **40.7 s** | **49.2 MHash/s** |
 
 - The cluster scales: 43.3 MHash/s is **2.4x** what one of those servers does with
   no cluster layer at all (18.3 MHash/s, same loop in bare `fork()`+`hashlib`), and
@@ -173,10 +193,33 @@ amount of work so a lucky hit cannot flatter the number.
   out 40 workers there costs 0.4-0.6 s out of a 78 s run. The 15-node 168-thread
   number is not comparable to it: per thread that rig got 0.29, this one 0.635.
 
+- **Doubling the node count on the same five hosts buys 1.94x, not 2.00x.** From
+  40 vCPU to 80 vCPU: 78.78 s -> 40.67 s for the same 2 G of hashes, i.e. 25.4 ->
+  49.2 MHash/s, and per-vCPU 0.635 -> 0.615 (**96.9 % retained, -3.1 %**). Fan-out
+  goes from 0.5-0.8 % of the run to 1.3-2.4 %; it is still the cheapest thing in
+  the pipeline.
+- **Where the win actually comes from.** On the same day, one 48-thread box does
+  18.7 MHash/s with 40 processes (0.468 each) and 17.5 with 48 (0.364 each) - past
+  one process per physical core, total throughput *falls*. The 40-node cluster
+  keeps 0.615 per vCPU, so it is 2.63x that box at 40 processes and 2.81x at 48,
+  and 1.69x per vCPU against the packed box. The gain is **not being squeezed onto
+  one socket pair**, not SSI magic: the same conclusion the 20-node round reached,
+  now at twice the size.
+
+| | 20 nodes | 40 nodes | ratio |
+|---|---|---|---|
+| vCPU | 40 | 80 | 2.00x |
+| wall clock, 2 G hashes | 78.78 s | 40.67 s | 1.94x faster |
+| throughput | 25.4 MHash/s | 49.2 MHash/s | **1.94x** |
+| per vCPU | 0.635 | 0.615 | **0.969x** |
+| fan-out share of runtime | 0.5-0.8 % | 1.3-2.4 % | |
+
 ![20-node cluster under full load](docs/images/krg-top-20nodes.png)
 
+![40-node cluster under full load](docs/images/krg-top-40nodes.png)
 Full environment, per-node numbers and the exact commands are in
-`docs/BENCHMARKS.md`.
+`docs/BENCHMARKS.md`; the two benchmark rounds have their own write-ups,
+`docs/REPORT_2026-10-27_20nodes.md` and `docs/REPORT_2026-10-27_40nodes.md`.
 ## Status
 
 A teaching prototype. It is honest about what it does, small enough to read in an
@@ -184,6 +227,21 @@ afternoon, and a reasonable starting point if you want to grow one SSI feature a
 a time on a modern kernel.
 
 ## 中文简介
+
+**一眼看结果（2026-10-27 实测，同一个负载：SHA-256 原像搜索）**
+
+| 组别 | 用了多少算力 | 吞吐 | 每份 |
+|---|---|---|---|
+| 单机 20 进程 | 20 进程 / 24 核 48 线程 | 16.3 MHash/s | **0.813** /进程 |
+| 单机 40 进程 | 40 进程 / 同一台机器 | 19.0 MHash/s | **0.474** /进程 |
+| 单机 48 进程（一线程一进程，塞满） | 48 进程 / 同一台机器 | 17.5 MHash/s | **0.364** /进程 |
+| **20 节点集群** | **40 vCPU**（5 宿主 × 4 VM） | **25.4 MHash/s** | **0.635** /vCPU |
+| **40 节点集群** | **80 vCPU**（5 宿主 × 8 VM） | **49.2 MHash/s** | **0.615** /vCPU |
+
+集群行是固定 2 G 哈希工作量、3 轮取中位；单机行是同一套内层循环、完全没有集群层。
+**集群是那台机器跑 40 进程的 2.63 倍、跑 48 进程的 2.81 倍** —— 赢的不是"共享了什么"，
+而是**没被挤在 24 个物理核上**。细节见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)、
+[20 节点报告](docs/REPORT_2026-10-27_20nodes.md)、[40 节点报告](docs/REPORT_2026-10-27_40nodes.md)。
 
 **krg-mini 是把 Kerrighed 的"单系统映像（SSI）"思路做到最小的一份实现。**
 Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一台：一张进程表、一份内存、
@@ -257,9 +315,27 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 40 个 worker 的分发只要 0.4–0.6 s，占 78 s 的不到 1%。
 注意 15 节点那组 49.2 是 168 个线程、而且宿主被压过头，不能和这里的 40 线程直接比（每线程 0.29 对 0.635）。
 
+**扩容到 40 个节点（同一批 5 台宿主，每台 8 台 VM，2 vCPU / 1.5 GiB，共 80 vCPU）**，
+同样的 2 G 工作量跑 3 轮：40.77 / 40.67 / 40.45 s，中位 **49.2 MHash/s**（每 vCPU 0.615）。
+
+| | 20 节点 | 40 节点 | 比值 |
+|---|---|---|---|
+| vCPU | 40 | 80 | 2.00 倍 |
+| 墙钟（2 G 哈希） | 78.78 s | 40.67 s | 快 1.94 倍 |
+| 吞吐 | 25.4 MHash/s | **49.2 MHash/s** | **1.94 倍** |
+| 每 vCPU | 0.635 | **0.615** | **96.9 %（掉 3.1 %）** |
+| 分发开销占墙钟 | 0.5–0.8 % | 1.3–2.4 % | |
+
+同一天在同一台 48 线程物理机上补测的裸机对照：40 进程 18.7 MHash/s（每进程 0.468）、
+48 进程 17.5（每进程 0.364，**塞满反而比 40 进程更慢**）。所以 40 节点集群是这台机器
+40 进程的 **2.63 倍**、48 进程的 **2.81 倍**，每 vCPU 是塞满状态下的 **1.69 倍**。
+结论和 20 节点那轮一致：**赢在"不用挤同一对 CPU"，不是赢在 SSI**。
+
 压力测试中的状态面板（`krg-top`，run 2 现场）：
 
 ![20 节点集群满负荷](docs/images/krg-top-20nodes.png)
+
+![40 节点集群满负荷](docs/images/krg-top-40nodes.png)
 
 **实时状态面板**（`krg-top`）：一个 HTML 页面显示每台机器的 CPU、内存、负载、内核和 worker 数，
 走 `krgtool exec` 取数，连不上的节点就照实显示连不上。

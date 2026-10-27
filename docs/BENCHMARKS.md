@@ -264,6 +264,94 @@ krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-p
 python3 raw_sha.py 20 40000000     # 20 processes, 800 M hashes total
 ```
 
+## Throughput: 40 nodes, 5 hosts x 8 VMs (2026-10-27)
+
+Same five hosts, same image, same workload — only the guest count changed. This is the
+before/after pair the project quotes, so both halves are listed side by side.
+
+| item | 20 nodes | 40 nodes |
+|---|---|---|
+| guests per host | 4 | 8 |
+| per guest | 2 vCPU / 2 GiB | 2 vCPU / 1.5 GiB |
+| total vCPU | 40 | 80 |
+| host vCPU load (48 threads) | 8 | 16 |
+| coordinator | separate ARM box, hashes nothing | same |
+| workload | `krg-crack --zeros 12 --budget 2000000000`, 2 workers/node | same |
+
+| run | counted | wall | rate | settle |
+|---|---|---|---|---|
+| 1 | 2,003,000,000 | 40.77 s | 49.1 MHash/s | 1.00 s |
+| 2 | 2,002,000,000 | 40.67 s | 49.2 MHash/s | 0.71 s |
+| 3 | 2,001,000,000 | 40.45 s | 49.5 MHash/s | 0.84 s |
+| **median** | | **40.67 s** | **49.2 MHash/s** | |
+
+### Scaling, 20 -> 40
+
+| | 20 nodes | 40 nodes | ratio |
+|---|---|---|---|
+| vCPU | 40 | 80 | 2.00x |
+| wall clock, 2 G hashes | 78.78 s | 40.67 s | 1.94x faster |
+| throughput | 25.4 MHash/s | 49.2 MHash/s | **1.94x** |
+| per vCPU | 0.635 | 0.615 | **0.969x (-3.1 %)** |
+| fan-out share of runtime | 0.5-0.8 % | 1.3-2.4 % | |
+
+- **Doubling vCPU bought 1.94x, not 2.00x.** The 3 % shortfall is what doubling both
+  the coordinator's round-trip load and each host's guest count should cost; the two
+  were not separated.
+- **Fan-out grew but is still trivial**: 0.54-1.00 s per run to start 80 workers on
+  40 nodes, i.e. 1.3-2.4 % of ~41 s (it was 0.5-0.8 % of 78 s at 20 nodes).
+
+### Same loop, no cluster layer, same day
+
+`raw_sha.py` on `nd20` (2x12-core Xeon E5-2650 v4, 48 threads, its own guests idle):
+
+| processes | work per process | wall | rate | per process |
+|---|---|---|---|---|
+| 40 | 20 M | 42.74 s | 18.7 MHash/s | 0.468 |
+| 48 | 20 M | 54.97 s | 17.5 MHash/s | 0.364 |
+
+The 48-process row is "one process per thread", the most that box can hold — and total
+throughput *drops* from the 40-process row while per-process collapses to 0.364. So:
+
+- 40-node cluster = **2.63x** that box at 40 processes, **2.81x** at 48.
+- Per vCPU the cluster (0.615) is **1.69x** the packed box (0.364) and **1.31x** it at
+  40 processes (0.468).
+
+That is the whole claim: at this size the cluster wins because 80 vCPU are not fighting
+over 24 physical cores, not because anything is shared. The 40-process baseline also
+reproduces the earlier 0.474 within 1.3 %, so the comparison is stable across the day.
+
+### One run that was wrong
+
+The first 40-node round reported 25.3 MHash/s — suspiciously equal to the 20-node
+number. Cause: the 20 new guests had the kernel module and `krgtool` but **not**
+`/usr/local/bin/krg-crack`, so 40 of the 80 spawned workers died instantly, while the
+coordinator still printed `workers 80 on 40 nodes` because it counts what it *asked
+for*, not what survived.
+
+Rule that came out of it: **before any benchmark, `ls -l /usr/local/bin/krg-crack` on
+every node.** A successful `spawn` is not evidence that a worker is alive. The 25.3
+figure is void and is quoted nowhere as a scaling result.
+
+![40-node cluster at full load: 40/40 nodes online, 80 cores at 99.7% CPU, 80
+workers](images/krg-top-40nodes.png)
+
+`krg-top` during the screenshot run: `nodes 40/40`, `cores 80`, `mem 13.1 / 66.9 GiB`,
+`workers 80`. The page is responsive by width (auto-fill, 320 px minimum), so it is 8
+columns on a wide monitor and 5 at 1920 px.
+
+### Reproducing (40 nodes)
+
+```sh
+wc -l /etc/krg-nodes.list                                  # 40
+ls -l /usr/local/bin/krg-crack                             # on EVERY node
+
+krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-per-node 2
+
+python3 raw_sha.py 40 20000000
+python3 raw_sha.py 48 20000000
+```
+
 The screenshot needs no scrubbing: node names are `<host>-<slot>`, and the page shows
 no addresses. Everything else in this document is the same — no hostnames, no IPs,
 no credentials.

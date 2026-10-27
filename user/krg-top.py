@@ -215,11 +215,7 @@ header{padding:16px 22px;border-bottom:1px solid var(--line);
 h1{font-size:22px;margin:0;letter-spacing:.5px}
 .kv{color:var(--dim);font-size:17px} .kv b{color:var(--fg);font-weight:600}
 main{padding:18px 22px}
-#grid{display:grid;gap:14px;grid-template-columns:repeat(4,minmax(0,1fr))}
-@media (max-width:1500px){#grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
-@media (max-width:1180px){#grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:880px){#grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:600px){#grid{grid-template-columns:1fr}}
+#grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));align-items:start}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
       padding:16px 18px}
 .card.off{opacity:.55;border-style:dashed}
