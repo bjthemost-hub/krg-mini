@@ -22,6 +22,8 @@ make -C "$HERE/user"
 install -m 0755 "$HERE/user/krgtool"  /usr/local/bin/krgtool
 install -m 0755 "$HERE/user/krg-pi.py" /usr/local/bin/krg-pi
 install -m 0755 "$HERE/user/krgsh.py"  /usr/local/bin/krgsh
+install -m 0755 "$HERE/user/krg-crack.py" /usr/local/bin/krg-crack
+install -m 0755 "$HERE/user/krg-top.py" /usr/local/bin/krg-top
 install -m 0644 "$HERE/deploy/krg-mini.service" /etc/systemd/system/krg-mini.service
 
 if [ -n "${2:-}" ]; then

@@ -18,6 +18,8 @@ What actually works today:
 | create / kill a task on another node | write `SPAWN <cmd>` or `KILL <gpid>` to `/dev/krgview`; the kernel uses `call_usermodehelper` / `kill_pid` |
 | cluster shell with built-in commands | `krgsh` — `free`, `top`, `ls`, `bash` run on every node and come back merged |
 | load-aware placement + retry | `krg-pi` asks every node for its run queue, places shards on the least loaded ones, and re-runs shards whose worker died |
+| throughput workload | `krg-crack` — SHA-256 preimage search; workers pull 1M-nonce chunks from a queue, the winner is re-hashed locally |
+| live status board | `krg-top` — one HTML page with every node's CPU, memory, load, kernel and worker count; reads through `krgtool exec` so unreachable nodes show as unreachable |
 
 What is **not** here: process migration, distributed shared memory, a distributed
 filesystem, a global scheduler in the kernel. Those are the hard 90% of Kerrighed.
@@ -29,6 +31,8 @@ module/krg_taskview.c   the whole kernel side: /dev/krgview (read table, write S
 user/krgtool.c          local/ serve/ show/ spawn/ kill/ load/ mem/ exec
 user/krgsh.py           cluster shell: free / top / ls / bash (+ nodes, show)
 user/krg-pi.py          distributed pi to N digits, used as the SSI demo workload
+user/krg-crack.py       SHA-256 preimage search, used to measure cluster throughput
+user/krg-top.py         live status board (HTTP + one HTML page, stdlib only)
 deploy/install.sh       build + install on one node
 deploy/krg-mini.service systemd unit (modprobe + krgtool serve 7700)
 deploy/krg-nodes.list.example
@@ -98,9 +102,33 @@ either: 4.8 s of every run is the serial Machin self-check and 2.3 s is the
 start-up term of the last shard. See `docs/BENCHMARKS.md` for the breakdown;
 the sharding scheme is the obvious thing to fix.
 
+## Measured throughput (2026-10-27, 15 nodes)
+
+`pi` is a latency workload and loses to one VM, so the second workload is pure
+throughput: `krg-crack` searches a SHA-256 hash prefix of 12 hex zeros, in
+1,000,000-nonce chunks pulled from the coordinator, with `--budget` pinning the
+amount of work so a lucky hit cannot flatter the number.
+
+| rig | threads | work | wall | rate |
+|---|---|---|---|---|
+| one VM (2 vCPU) | 2 | 60 M | 45.6 s | 1.3 MHash/s |
+| 12 VMs over 3 hosts | 24 | 601 M | 40.3 s | 14.9 MHash/s |
+| one 48-thread server | 48 | 1.00 G | 69.1 s | 14.5 MHash/s |
+| **15-node cluster (3 servers + 12 VMs)** | **168** | **2.00 G** | **46.3 s** | **43.3 MHash/s** |
+
+- The cluster scales: 43.3 MHash/s is **2.4x** what one of those servers does with
+  no cluster layer at all (18.3 MHash/s, same loop in bare `fork()`+`hashlib`), and
+  **33x** a single 2-vCPU VM.
+- The win is core count, not the SSI. Per thread the cluster gets 0.26 MHash/s
+  against 0.38 on bare metal — about 68% — because the coordinator is one Python
+  process doing a socket round trip per chunk, and the head node also hosts four VMs.
+- 24 VM threads land on the same 14.9–14.5 MHash/s as one 48-thread box: those 48
+  are 24 physical cores with SMT, and CPython's SHA-256 gains almost nothing from
+  the sibling thread.
+- Fanning out 168 workers across 15 nodes costs 4.9 s of the 46 s run.
+
 Full environment, per-node numbers and the exact commands are in
 `docs/BENCHMARKS.md`.
-
 ## Status
 
 A teaching prototype. It is honest about what it does, small enough to read in an
@@ -120,6 +148,8 @@ Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一�
 | 在别的节点上建 / 杀进程 | 往 `/dev/krgview` 写 `SPAWN <命令>` 或 `KILL <全局pid>`，由**内核**用 `call_usermodehelper` / `kill_pid` 执行 |
 | 集群 shell | `krgsh`：`free` / `top` / `ls` / `bash` 一条命令扇出到所有节点，结果按节点分块显示 |
 | 按负载分配 + 失败重试 | `krg-pi`：先问每台机器的运行队列长度，把分片放到最闲的节点，超时没回来的分片换节点重算（最多 3 轮） |
+| 吞吐型负载 | `krg-crack`：SHA-256 原像搜索。worker 从队列里按 100 万个 nonce 一块地领，命中的那块在本地重算一遍再报，防止误报 |
+| 实时状态面板 | `krg-top`：一个 HTML 页面显示每个节点的 CPU / 内存 / 负载 / 内核 / worker 数；数据也是走 `krgtool exec` 取的，连不上的节点直接标成连不上 |
 
 **没做的**（也就是 Kerrighed 真正难的那 90%）：进程迁移、分布式共享内存、共享文件系统、
 内核里的全局调度。这里的 `ls` 只是"同一个路径在每台机器各列一遍"，因为节点之间并没有共享文件系统。
@@ -129,6 +159,16 @@ Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一�
 结果用独立的 Machin 公式逐位校验通过，中位 307 ms；`--digits 50000` 用时 7.9 s。
 **100 位这个量级本来只有 0.1–0.2 ms 的算术量，307 ms 全是协调开销** ——
 数字怎么看、怎么复现，都写在 `docs/BENCHMARKS.md` 里，没有粉饰。
+
+**吞吐型负载**（`krg-crack`：SHA-256 原像搜索，用 `--zeros 12 --budget` 定死工作量）：
+单台 2 vCPU 虚拟机 1.3、12 台虚拟机（24 vCPU）14.9、单台 48 线程物理机 14.5，
+**15 节点集群（3 台物理机 + 12 台虚拟机，168 个 worker）43.3 MHash/s** ——
+是单台物理机**裸机**（18.3）的 2.4 倍、单虚拟机的 33 倍。
+但每线程只有 0.26（裸机 0.38，约 68%）：**扩出来的收益来自核数，不是来自 SSI**，
+协调端是单个 Python 进程，168 个 worker 的分发本身要 4.9 s。
+
+**实时状态面板**（`krg-top`）：一个 HTML 页面显示每台机器的 CPU、内存、负载、内核和 worker 数，
+走 `krgtool exec` 取数，连不上的节点就照实显示连不上。
 
 **安全提醒**：`krgtool serve` 没有任何认证，能执行任意 shell 命令，只能跑在可信内网。
 
