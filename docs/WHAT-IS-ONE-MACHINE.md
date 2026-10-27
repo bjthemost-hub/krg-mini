@@ -10,7 +10,7 @@ usually *claimed* — and in the order they are actually hard.
 | # | property | what a user would see | what this tree does today | verdict |
 |---|---|---|---|---|
 | 1 | **one process space** | `ps` on any node lists every task in the cluster; `kill <pid>` works from anywhere | each node exports its task table through `/dev/krgview`; userspace merges them; every task carries a global pid = `node_id << 24 \| pid` | **implemented** |
-| 2 | **one CPU** | one run queue, one scheduler; a new task lands on the least loaded core of the whole cluster without anyone choosing | reads `nproc` and load per node and *prints a sum*; `krg-pi` picks nodes in **userspace** before spawning | **not implemented** |
+| 2 | **one CPU** | one run queue, one scheduler; a new task lands on the least loaded core of the whole cluster without anyone choosing | a sum for display; `krg-pi` picks in userspace; **since v0.1 the kernel itself places `SPAWN`ed tasks and reserves the target** — but ordinary `fork`/`exec` still lands locally and nothing rebalances | **partial** |
 | 3 | **one memory** | an address range allocated on node A can be read and written from node B, coherently | sums `MemTotal` / `MemFree` per node and prints one "cluster" line | **not implemented** |
 | 4 | **one file system** | the same path resolves to the same bytes everywhere | `krgsh ls` runs `ls` on every node and prints the results side by side | **not implemented** |
 
@@ -24,7 +24,7 @@ like a single machine today.
 It is a **birth identity**, not a location: the pid says where the task was created,
 not where it runs now (nothing migrates yet).
 
-## 2. One CPU — not implemented
+## 2. One CPU — partial: kernel initial placement
 
 What exists:
 
@@ -33,12 +33,24 @@ What exists:
   presentation of 20 independent numbers, not a scheduler.
 - `krg-pi` asks every node for its run queue and places shards on the least loaded
   one — **in userspace, before the work starts**, and only for work it creates itself.
+- **Since khz v0.1 the placement decision moved into the kernel** for tasks submitted
+  through `SPAWN`. The module keeps a small load table (`LOAD <node> <runq> <seq>`,
+  stale samples rejected), picks the node with the lowest `runq + reservations`,
+  breaks ties round-robin, and **reserves** it under one lock so that a burst of
+  callers cannot all pick the same idle node (`KRGV_IOC_PLACE` / `_RELEASE`).
+  `krgtool spawn --auto` only collects the numbers and forwards the task to the node
+  the kernel chose; it never re-picks. Acceptance test: with node 3 loaded
+  (`runq 5`) and node 2 idle (`runq 2`), `spawn --auto` lands on node 2, and the task
+  shows up there with `gpid = 2 << 24 | pid` in the merged `krgtool show`.
 
 What does not exist: a single run queue. Each node's kernel schedules its own tasks
 with its own CFS instance. A task cannot be moved to another node's CPU. There is no
-place in the system where a scheduling decision covering two nodes is made.
+place where a decision covering two nodes is made for an ordinary `fork`/`exec` —
+only `SPAWN` goes through the kernel's placement, and nothing rebalances a task that
+is already running.
 
-So the honest sentence is: **the cluster reports one CPU; it does not have one.**
+So the honest sentence is: **the cluster reports one CPU; the kernel now places new
+`SPAWN`ed tasks across nodes, but there is still no shared run queue.**
 
 ## 3. One memory — not implemented
 

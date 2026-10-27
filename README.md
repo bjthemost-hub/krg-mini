@@ -52,7 +52,8 @@ out of scope for v0.1. Criteria: [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-
 - [ ] **single-shell cross-node jobs** — the command runs once, a pipeline's stages land on different machines, `Ctrl-C` stops the whole job, exit codes come back
 - [ ] **remote fork** — the child lands on another node and keeps the parent's fds / pipes / sockets (not re-opened by path)
 - [ ] **identity vs location** — `node_id << 24 | pid` is a birth identity only; where it runs now needs a lookup
-- [ ] **placement in the kernel** — new tasks land on the idlest node without anyone asking (**khz v0.1**)
+- [x] **kernel initial placement for `SPAWN`** — no target given, the kernel picks the idlest node and reserves it (**khz v0.1**)
+- [ ] **placement for ordinary `fork`/`exec`, and rebalance** — only `SPAWN` goes through the kernel's policy today; a running task is never moved
 - [ ] **DSM** — an address range visible from every node, with write ownership (**khz v0.1**)
 - [x] scale out to 5 physical hosts + 20 VMs (4 VMs per host, physical boxes are hosts only)
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
@@ -66,6 +67,7 @@ What actually works today:
 |---|---|
 | one process table across nodes | `/dev/krgview` exports each node's task list; `krgtool show` merges them. Every task carries a **global pid** = `node_id << 24 \| pid`. |
 | create / kill a task on another node | write `SPAWN <cmd>` or `KILL <gpid>` to `/dev/krgview`; the kernel uses `call_usermodehelper` / `kill_pid` |
+| placement in the kernel | `SPAWN` with no target: the module keeps a per-node load table (`LOAD <node> <runq> <seq>`, stale seq rejected), picks min `runq + reservations`, breaks ties round-robin, and reserves the pick (`KRGV_IOC_PLACE` / `_RELEASE`). `krgtool spawn --auto` feeds the numbers and forwards to whatever the kernel chose — it never re-picks. |
 | cluster shell with built-in commands | `krgsh` — `free`, `top`, `ls`, `bash` run on every node and come back merged |
 | load-aware placement + retry | `krg-pi` asks every node for its run queue, places shards on the least loaded ones, and re-runs shards whose worker died |
 | throughput workload | `krg-crack` — SHA-256 preimage search; workers pull 1M-nonce chunks from a queue, the winner is re-hashed locally |
@@ -280,7 +282,8 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 - [ ] **单 shell 的跨节点作业** —— 一条命令只执行一次，管道各段落在不同机器上，`Ctrl-C` 能停整条作业，退出码能回来
 - [ ] **远程 fork** —— 子进程落到别的节点，并且保留父进程的 fd / 管道 / socket（不是按路径重新打开）
 - [ ] **身份与位置分开** —— `节点号 << 24 | pid` 只当出生身份，跑在哪要另查
-- [ ] **内核里的放置** —— 新任务自动落到最闲的节点（**khz v0.1**）
+- [x] **`SPAWN` 的内核初始放置** —— 不指定节点时，由内核挑最闲的节点并做预留（**khz v0.1**）
+- [ ] **普通 `fork` / `exec` 的放置与再平衡** —— 现在只有 `SPAWN` 走内核策略，跑起来的进程不会迁移
 - [ ] **DSM** —— 一段地址空间多节点可见，写要有归属（**khz v0.1**）
 - [x] 扩到 5 台物理机 + 20 台虚拟机（2026-10-27：5 台宿主各跑 4 台 VM = 20 个节点，物理机只当宿主）
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，

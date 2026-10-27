@@ -5,6 +5,11 @@
  *   krgtool show peer:port,...    merge local + remote nodes into one table
  *   krgtool spawn peer:port cmd   ask that node's kernel to create a task
  *   krgtool kill  peer:port gpid  ask that node's kernel to kill a task
+ *   krgtool spawn --auto [--nodes FILE] cmd
+ *                                 let the LOCAL KERNEL pick the node, then run there
+ *   krgtool place                 print the node the kernel would pick now
+ *   krgtool release ticket        give a reservation back
+ *   krgtool state                 dump the load table the kernel is using
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -15,8 +20,10 @@
 #include <errno.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 #define DEV		"/dev/krgview"
 #define KRGV_MAGIC	0x4b524779u
@@ -30,6 +37,28 @@ struct krgv_task {
 	unsigned pid, tgid, ppid, state, rss_kb, gpid;
 	char comm[16];
 };
+
+/* ---- placement, mirrored from module/krg_taskview.c --------------------- */
+
+#define KRGV_NODES	256
+
+struct krgv_node_load {
+	unsigned runq, seq, reserved, valid;
+};
+
+struct krgv_place {
+	unsigned node, ticket, runq, self;
+};
+
+struct krgv_state {
+	unsigned self, nvalid, tickets_used, pad;
+	struct krgv_node_load n[KRGV_NODES];
+};
+
+#define KRGV_IOC_MAGIC		'K'
+#define KRGV_IOC_PLACE		_IOR(KRGV_IOC_MAGIC, 1, struct krgv_place)
+#define KRGV_IOC_RELEASE	_IOW(KRGV_IOC_MAGIC, 2, unsigned)
+#define KRGV_IOC_STATE		_IOR(KRGV_IOC_MAGIC, 3, struct krgv_state)
 
 static const char *st_name(unsigned s)
 {
@@ -305,6 +334,187 @@ static int remote_cmd(const char *peer, const char *cmd)
 	return strncmp(buf, "OK", 2) ? -1 : 0;
 }
 
+/* same, but hand the reply back instead of printing it */
+static int remote_cmd_buf(const char *peer, const char *cmd, char *out, size_t len)
+{
+	char host[128];
+	ssize_t r;
+	int fd;
+
+	fd = connect_node(peer, host, sizeof(host));
+	if (fd < 0)
+		return -1;
+	if (write(fd, cmd, strlen(cmd)) != (ssize_t)strlen(cmd)) {
+		close(fd);
+		return -1;
+	}
+	r = read(fd, out, len - 1);
+	close(fd);
+	if (r <= 0)
+		return -1;
+	out[r] = 0;
+	out[strcspn(out, "\r\n")] = 0;
+	return 0;
+}
+
+/* ---- placement ---------------------------------------------------------- */
+
+static unsigned now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
+}
+
+/* ask one peer for its run queue, and put it into the local kernel's table */
+static int collect_one(const char *peer, unsigned *nid_out, unsigned *run_out)
+{
+	char rep[256], cmd[128];
+	unsigned nid, run, cnt;
+	ssize_t w;
+	int fd;
+
+	if (remote_cmd_buf(peer, "LOAD\n", rep, sizeof(rep)) < 0) {
+		fprintf(stderr, "%s: no reply\n", peer);
+		return -1;
+	}
+	if (sscanf(rep, "OK %u %u %u", &nid, &run, &cnt) != 3) {
+		fprintf(stderr, "%s: bad reply '%s'\n", peer, rep);
+		return -1;
+	}
+
+	fd = open(DEV, O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", DEV, strerror(errno));
+		return -1;
+	}
+	snprintf(cmd, sizeof(cmd), "LOAD %u %u %u\n", nid, run, now_ms());
+	w = write(fd, cmd, strlen(cmd));
+	close(fd);
+	if (w != (ssize_t)strlen(cmd)) {
+		fprintf(stderr, "write %s: %s\n", DEV,
+			w < 0 ? strerror(errno) : "short write");
+		return -1;
+	}
+
+	*nid_out = nid;
+	*run_out = run;
+	return 0;
+}
+
+static int kernel_place(struct krgv_place *p)
+{
+	int fd = open(DEV, O_RDONLY);
+	int ret;
+
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", DEV, strerror(errno));
+		return -1;
+	}
+	ret = ioctl(fd, KRGV_IOC_PLACE, p);
+	if (ret < 0)
+		fprintf(stderr, "PLACE: %s (module too old? reinstall)\n",
+			strerror(errno));
+	close(fd);
+	return ret < 0 ? -1 : 0;
+}
+
+static void kernel_release(unsigned ticket)
+{
+	int fd = open(DEV, O_RDONLY);
+
+	if (fd < 0)
+		return;
+	ioctl(fd, KRGV_IOC_RELEASE, &ticket);
+	close(fd);
+}
+
+/* every address in the node list, plus its node id as the node itself reports it */
+struct peer_nid {
+	char addr[160];
+	unsigned nid;
+};
+
+static int load_node_list(const char *path, struct peer_nid *peers, int max)
+{
+	FILE *fp = fopen(path, "r");
+	char line[256];
+	int n = 0;
+
+	if (!fp) {
+		fprintf(stderr, "%s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	while (fgets(line, sizeof(line), fp) && n < max) {
+		char name[64], addr[160];
+
+		line[strcspn(line, "\r\n")] = 0;
+		if (line[0] == '#' || !line[0])
+			continue;
+		if (sscanf(line, "%63s %159s", name, addr) != 2)
+			continue;
+		snprintf(peers[n].addr, sizeof(peers[n].addr), "%s", addr);
+		peers[n].nid = 0;
+		n++;
+	}
+	fclose(fp);
+	return n;
+}
+
+/* "krgtool spawn --auto [--nodes FILE] cmd": kernel picks, we forward. */
+static int spawn_auto(const char *nodes_path, const char *command)
+{
+	static struct peer_nid peers[KRGV_NODES];
+	struct krgv_place p;
+	char cmd[1200];
+	int n, i, rc = -1;
+
+	n = load_node_list(nodes_path, peers, KRGV_NODES);
+	if (n <= 0) {
+		fprintf(stderr, "no nodes in %s\n", nodes_path);
+		return -1;
+	}
+
+	for (i = 0; i < n; i++) {
+		unsigned nid = 0, run = 0;
+
+		if (collect_one(peers[i].addr, &nid, &run) == 0) {
+			peers[i].nid = nid;
+			fprintf(stderr, "  %-12s node %-3u runq %u\n",
+				peers[i].addr, nid, run);
+		} else {
+			peers[i].nid = 0;
+		}
+	}
+
+	if (kernel_place(&p) < 0)
+		return -1;
+
+	if (p.node == p.self) {
+		snprintf(cmd, sizeof(cmd), "SPAWN %s\n", command);
+		rc = local_write_cmd(cmd, strlen(cmd)) ? -1 : 0;
+	} else {
+		for (i = 0; i < n; i++) {
+			if (peers[i].nid != p.node)
+				continue;
+			snprintf(cmd, sizeof(cmd), "SPAWN %s\n", command);
+			rc = remote_cmd(peers[i].addr, cmd);
+			break;
+		}
+		if (i == n) {
+			fprintf(stderr, "node %u is not in %s\n", p.node, nodes_path);
+			rc = -1;
+		}
+	}
+
+	if (rc)
+		kernel_release(p.ticket);
+	fprintf(stderr, "placed node=%u ticket=%u runq=%u self=%u %s\n",
+		p.node, p.ticket, p.runq, p.self, rc ? "FAILED" : "ok");
+	return rc;
+}
+
 static void serve(int port)
 {
 	int ls, one = 1;
@@ -440,10 +650,50 @@ static void usage(void)
 		"       krgtool serve [port]\n"
 		"       krgtool show peer:port[,peer:port...]\n"
 		"       krgtool spawn peer:port \"command\"\n"
+		"       krgtool spawn --auto [--nodes FILE] \"command\"\n"
 		"       krgtool kill peer:port gpid\n"
 		"       krgtool load peer:port\n"
 		"       krgtool mem peer:port\n"
-		"       krgtool exec peer:port \"command\"\n");
+		"       krgtool exec peer:port \"command\"\n"
+		"       krgtool place\n"
+		"       krgtool release ticket\n"
+		"       krgtool state\n");
+}
+
+static int print_state(void)
+{
+	struct krgv_state *s;
+	int fd, i;
+
+	fd = open(DEV, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", DEV, strerror(errno));
+		return -1;
+	}
+	s = malloc(sizeof(*s));
+	if (!s) {
+		close(fd);
+		return -1;
+	}
+	if (ioctl(fd, KRGV_IOC_STATE, s) < 0) {
+		fprintf(stderr, "STATE: %s\n", strerror(errno));
+		close(fd);
+		free(s);
+		return -1;
+	}
+	close(fd);
+
+	printf("self %u  nodes with load %u  reservations open %u\n",
+	       s->self, s->nvalid, s->tickets_used);
+	printf("%-6s %-8s %-10s %s\n", "NODE", "RUNQ", "RESERVED", "SEQ");
+	for (i = 0; i < KRGV_NODES; i++) {
+		if (!s->n[i].valid)
+			continue;
+		printf("%-6d %-8u %-10u %u\n", i, s->n[i].runq,
+		       s->n[i].reserved, s->n[i].seq);
+	}
+	free(s);
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -481,10 +731,51 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	if (!strcmp(argv[1], "spawn") && argc >= 4 && !strcmp(argv[2], "--auto")) {
+		const char *nodes = getenv("KRG_NODES");
+		char command[1024];
+		int i = 3;
+
+		if (!nodes)
+			nodes = "/etc/krg-nodes.list";
+		if (!strcmp(argv[3], "--nodes")) {
+			if (argc < 6) {
+				usage();
+				return 1;
+			}
+			nodes = argv[4];
+			i = 5;
+		}
+		if (i >= argc) {
+			usage();
+			return 1;
+		}
+		snprintf(command, sizeof(command), "%s", argv[i]);
+		return spawn_auto(nodes, command) ? 1 : 0;
+	}
+
 	if (!strcmp(argv[1], "spawn") && argc >= 4) {
 		snprintf(cmd, sizeof(cmd), "SPAWN %s\n", argv[3]);
 		return remote_cmd(argv[2], cmd) ? 1 : 0;
 	}
+
+	if (!strcmp(argv[1], "place")) {
+		struct krgv_place p;
+
+		if (kernel_place(&p))
+			return 1;
+		printf("node %u ticket %u runq %u self %u\n",
+		       p.node, p.ticket, p.runq, p.self);
+		return 0;
+	}
+
+	if (!strcmp(argv[1], "release") && argc >= 3) {
+		kernel_release((unsigned)strtoul(argv[2], NULL, 10));
+		return 0;
+	}
+
+	if (!strcmp(argv[1], "state"))
+		return print_state() ? 1 : 0;
 
 	if (!strcmp(argv[1], "kill") && argc >= 4) {
 		snprintf(cmd, sizeof(cmd), "KILL %s\n", argv[3]);

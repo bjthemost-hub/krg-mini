@@ -6,12 +6,21 @@
  *                         cluster-wide gpid = (node_id << 24) | pid
  *                 write : "SPAWN <shell command>"  create a task on this node
  *                         "KILL <gpid>"            kill a task by global pid
+ *                         "LOAD <node> <runq> <seq>"  feed one node's load
+ *                 ioctl : PLACE    pick the idlest node and reserve it
+ *                         RELEASE  give a reservation back
+ *                         STATE    dump the load table the kernel is using
  *
- * Userspace (krgtool) merges nodes and forwards SPAWN/KILL.
+ * The placement decision (which node, and the reservation that stops a burst
+ * of callers from all picking the same idle node) is made here, under one
+ * lock. Userspace only collects the per-node numbers and forwards the task to
+ * the node this kernel chose.
  */
 #include <linux/module.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
+#include <linux/ioctl.h>
+#include <linux/jiffies.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
@@ -48,6 +57,39 @@ struct krgv_hdr {
 	__u32 mem_free_kb;
 };
 
+/* ---- placement ---------------------------------------------------------- */
+
+#define KRGV_NODES	256	/* node_id is one byte */
+#define KRGV_TICKETS	128	/* outstanding reservations we can track */
+#define KRGV_TTL_MS	15000	/* a reservation nobody releases expires */
+
+struct krgv_node_load {
+	__u32 runq;
+	__u32 seq;
+	__u32 reserved;
+	__u32 valid;
+};
+
+struct krgv_place {
+	__u32 node;	/* out: chosen node id */
+	__u32 ticket;	/* out: (node << 24) | serial; pass to RELEASE */
+	__u32 runq;	/* out: that node's runq when the decision was made */
+	__u32 self;	/* out: this node's id */
+};
+
+struct krgv_state {
+	__u32 self;
+	__u32 nvalid;
+	__u32 tickets_used;
+	__u32 pad;
+	struct krgv_node_load n[KRGV_NODES];
+};
+
+#define KRGV_IOC_MAGIC		'K'
+#define KRGV_IOC_PLACE		_IOR(KRGV_IOC_MAGIC, 1, struct krgv_place)
+#define KRGV_IOC_RELEASE	_IOW(KRGV_IOC_MAGIC, 2, __u32)
+#define KRGV_IOC_STATE		_IOR(KRGV_IOC_MAGIC, 3, struct krgv_state)
+
 static unsigned int node_id = 0;
 module_param(node_id, uint, 0444);
 MODULE_PARM_DESC(node_id, "cluster node id (1..255), used in gpid");
@@ -64,6 +106,162 @@ static u32 krgv_state(struct task_struct *p)
 #else
 	return (u32)READ_ONCE(p->state);
 #endif
+}
+
+/* ---- placement state ---------------------------------------------------- */
+
+static struct krgv_node_load krgv_loads[KRGV_NODES];
+static DEFINE_SPINLOCK(krgv_lock);
+static u32 krgv_serial;
+static u32 krgv_rr;
+
+struct krgv_ticket {
+	__u32 ticket;
+	__u32 node;
+	unsigned long expires;
+};
+
+static struct krgv_ticket krgv_tickets[KRGV_TICKETS];
+
+static u32 krgv_self_runq(void)
+{
+	struct task_struct *p;
+	u32 n = 0;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		if (krgv_state(p) == TASK_RUNNING)
+			n++;
+	}
+	rcu_read_unlock();
+	return n;
+}
+
+/*
+ * Feed one node's numbers in. Rejecting an older seq keeps two collectors from
+ * making the table go backwards.
+ */
+static int krgv_set_load(u32 nid, u32 runq, u32 seq)
+{
+	if (nid >= KRGV_NODES)
+		return -EINVAL;
+
+	spin_lock(&krgv_lock);
+	if (!krgv_loads[nid].valid ||
+	    (s32)(seq - krgv_loads[nid].seq) > 0) {
+		krgv_loads[nid].runq = runq;
+		krgv_loads[nid].seq = seq;
+		krgv_loads[nid].valid = 1;
+	}
+	spin_unlock(&krgv_lock);
+	return 0;
+}
+
+/* Reservations that were never released must not bias placement forever. */
+static void krgv_reap_locked(unsigned long now)
+{
+	int i;
+
+	for (i = 0; i < KRGV_TICKETS; i++) {
+		u32 node;
+
+		if (!krgv_tickets[i].ticket)
+			continue;
+		if (time_before(now, krgv_tickets[i].expires))
+			continue;
+		node = krgv_tickets[i].node;
+		if (node < KRGV_NODES && krgv_loads[node].reserved)
+			krgv_loads[node].reserved--;
+		krgv_tickets[i].ticket = 0;
+	}
+}
+
+static int krgv_place(struct krgv_place *out)
+{
+	unsigned long now = jiffies;
+	u32 self = node_id & 0xff;
+	u32 self_runq = krgv_self_runq();
+	u32 best = self, best_score = ~0u, best_runq = self_runq;
+	int slot = -1, k;
+
+	spin_lock(&krgv_lock);
+	krgv_reap_locked(now);
+
+	for (k = 0; k < (int)KRGV_NODES; k++) {
+		struct krgv_node_load *l;
+		u32 idx = (k + krgv_rr) % KRGV_NODES;
+		u32 score, runq;
+
+		l = &krgv_loads[idx];
+		if (idx == self) {
+			runq = self_runq;
+		} else {
+			if (!l->valid)
+				continue;
+			runq = l->runq;
+		}
+		score = runq + l->reserved;
+		if (score < best_score) {
+			best_score = score;
+			best_runq = runq;
+			best = idx;
+		}
+	}
+
+	krgv_rr = (best + 1) % KRGV_NODES;
+	krgv_loads[best].reserved++;
+	krgv_serial++;
+
+	for (k = 0; k < KRGV_TICKETS; k++) {
+		if (!krgv_tickets[k].ticket) {
+			slot = k;
+			break;
+		}
+	}
+	if (slot < 0) {
+		/* table full: evict the entry closest to expiry */
+		unsigned long oldest = 0;
+
+		slot = 0;
+		for (k = 0; k < KRGV_TICKETS; k++) {
+			if (!oldest || time_before(krgv_tickets[k].expires, oldest)) {
+				oldest = krgv_tickets[k].expires;
+				slot = k;
+			}
+		}
+		if (krgv_loads[krgv_tickets[slot].node].reserved)
+			krgv_loads[krgv_tickets[slot].node].reserved--;
+	}
+	krgv_tickets[slot].ticket = (best << 24) | (krgv_serial & 0x00ffffffu);
+	krgv_tickets[slot].node = best;
+	krgv_tickets[slot].expires = now + msecs_to_jiffies(KRGV_TTL_MS);
+
+	out->node = best;
+	out->ticket = krgv_tickets[slot].ticket;
+	out->runq = best_runq;
+	out->self = self;
+	spin_unlock(&krgv_lock);
+	return 0;
+}
+
+static void krgv_release(u32 ticket)
+{
+	u32 nid = ticket >> 24;
+	int i;
+
+	if (nid >= KRGV_NODES)
+		return;
+
+	spin_lock(&krgv_lock);
+	for (i = 0; i < KRGV_TICKETS; i++) {
+		if (krgv_tickets[i].ticket != ticket)
+			continue;
+		krgv_tickets[i].ticket = 0;
+		if (krgv_loads[nid].reserved)
+			krgv_loads[nid].reserved--;
+		break;
+	}
+	spin_unlock(&krgv_lock);
 }
 
 static void krgv_fill(struct task_struct *p, struct krgv_task *t)
@@ -228,6 +426,14 @@ static ssize_t krgv_write(struct file *fp, const char __user *ubuf,
 		ret = krgv_kill(gpid);
 		return ret ? ret : (ssize_t)len;
 	}
+	if (!strncmp(buf, "LOAD ", 5)) {
+		unsigned int nid, runq, seq;
+
+		if (sscanf(buf + 5, "%u %u %u", &nid, &runq, &seq) != 3)
+			return -EINVAL;
+		ret = krgv_set_load(nid, runq, seq);
+		return ret ? ret : (ssize_t)len;
+	}
 	return -EINVAL;
 }
 
@@ -236,11 +442,63 @@ static int krgv_open(struct inode *inode, struct file *fp)
 	return 0;
 }
 
+static long krgv_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case KRGV_IOC_PLACE: {
+		struct krgv_place p;
+		int ret = krgv_place(&p);
+
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+			return -EFAULT;
+		return 0;
+	}
+	case KRGV_IOC_RELEASE: {
+		__u32 ticket;
+
+		if (copy_from_user(&ticket, (void __user *)arg, sizeof(ticket)))
+			return -EFAULT;
+		krgv_release(ticket);
+		return 0;
+	}
+	case KRGV_IOC_STATE: {
+		struct krgv_state *s = kzalloc(sizeof(*s), GFP_KERNEL);
+		u32 i, nvalid = 0;
+
+		if (!s)
+			return -ENOMEM;
+		spin_lock(&krgv_lock);
+		s->self = node_id & 0xff;
+		for (i = 0; i < KRGV_NODES; i++) {
+			s->n[i] = krgv_loads[i];
+			if (krgv_loads[i].valid)
+				nvalid++;
+		}
+		for (i = 0; i < KRGV_TICKETS; i++)
+			if (krgv_tickets[i].ticket)
+				s->tickets_used++;
+		s->nvalid = nvalid;
+		spin_unlock(&krgv_lock);
+		if (copy_to_user((void __user *)arg, s, sizeof(*s))) {
+			kfree(s);
+			return -EFAULT;
+		}
+		kfree(s);
+		return 0;
+	}
+	default:
+		return -ENOTTY;
+	}
+}
+
 static const struct file_operations krgv_fops = {
 	.owner = THIS_MODULE,
 	.open  = krgv_open,
 	.read  = krgv_read,
 	.write = krgv_write,
+	.unlocked_ioctl = krgv_ioctl,
 	.llseek = noop_llseek,
 };
 
