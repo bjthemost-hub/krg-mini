@@ -1,10 +1,13 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 
-all: krgtool
+all: krgtool dsmread
 
 krgtool: krgtool.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+dsmread: dsmread.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
+
 clean:
-	rm -f krgtool
+	rm -f krgtool dsmread

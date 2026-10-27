@@ -25,8 +25,8 @@ anything being shared, it is not being squeezed onto 24 physical cores. Details:
 Kerrighed was a Single System Image (SSI) cluster: many Linux boxes that look like
 one machine — one process table, one memory, one scheduler, live process migration.
 It died with 2.6.30. **krg-mini** keeps the idea and throws away almost everything
-else: 962 lines across two kernel modules (`krg_taskview.c` 530, `krg_dsm.c` 432)
-plus six userspace tools (2510 lines), built against a stock Ubuntu 22.04 kernel,
+else: 1256 lines across two kernel modules (`krg_taskview.c` 530, `krg_dsm.c` 726)
+plus seven userspace tools (2793 lines), built against a stock Ubuntu 22.04 kernel,
 no patch required.
 
 An SSI is four things at once. Here is where this project stands — no more, no less
@@ -37,7 +37,7 @@ An SSI is four things at once. Here is where this project stands — no more, no
 | one process space — `ps` / `kill` on any node reaches every task | **yes**: `/dev/krgview` exports each node's table, merged in userspace, global pid = `node_id << 24 \| pid` |
 | a task can be created on any node | **partial**: `SPAWN` starts a process on another node, but it is not part of the caller's process tree |
 | one file system — same path, same bytes everywhere | **no**: `krgsh ls` runs `ls` per node and prints the results side by side |
-| one memory — an address range visible from every node | **partial**: `/dev/krgdsm` named segments, pages cost memory only when touched, a reader can pull into a bounded cache and read a segment far bigger than its own RAM — but through read/write calls, not pointers, and the far side is read-only |
+| one memory — an address range visible from every node | **partial**: `/dev/krgdsm` segments can be `mmap`ed and read with **plain pointer loads** — a fault for a page that is not here is answered by a helper thread that pulls it from the home node. Pages cost memory only when touched, and a bounded cache lets one node stream a segment far bigger than its RAM. The far side is read-only; there is no write coherence |
 
 **Target release khz v0.1**: properties 1–3 above — one process space, one CPU, one
 memory — each with an acceptance test anyone can rerun. One file system is explicitly
@@ -56,7 +56,8 @@ out of scope for v0.1. Criteria: [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-
 - [x] **kernel initial placement for `SPAWN`** — no target given, the kernel picks the idlest node and reserves it (**khz v0.1**)
 - [ ] **placement for ordinary `fork`/`exec`, and rebalance** — only `SPAWN` goes through the kernel's policy today; a running task is never moved
 - [x] **paged DSM** — named segments in `/dev/krgdsm`: lazy pages, `DSMGET` in 64-page batches, bounded read cache (**khz v0.1**)
-- [ ] **DSM as memory** — a shared address space with faults and write ownership, instead of explicit read/write calls (one home per segment today)
+- [x] **DSM as memory** — `mmap` a segment and dereference it; faults are forwarded to a helper that fetches the page (**khz v0.1**)
+- [ ] **write coherence** — the far side of a segment is read-only; no write ownership, no invalidation, one home per segment
 - [x] scale out to 5 physical hosts + 20 VMs (4 VMs per host, physical boxes are hosts only)
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
 agree), then a process tree that spans nodes (remote fork with fd/pipe objects
@@ -74,11 +75,12 @@ What actually works today:
 | load-aware placement + retry | `krg-pi` asks every node for its run queue, places shards on the least loaded ones, and re-runs shards whose worker died |
 | throughput workload | `krg-crack` — SHA-256 preimage search; workers pull 1M-nonce chunks from a queue, the winner is re-hashed locally |
 | paged shared memory | `krgdsm` + `/dev/krgdsm` — a segment is a name plus page slots; `alloc` reserves slots, `write` allocates the page, `seal` freezes, `DSMGET` pulls pages from the home node 64 at a time, `--cache N` caps the reader at N pages and evicts the oldest |
+| shared memory as memory | `dsmread` — `ATTACH` + `mmap` a segment; a page fault is posted to a request list, a helper thread pulls the page from the peer and completes the fault, with 64-page prefetch so one round trip serves 64 faults |
 | live status board | `krg-top` — one HTML page with every node's CPU, memory, load, kernel and worker count; reads through `krgtool exec` so unreachable nodes show as unreachable |
 
-What is **not** here: process migration, a shared address space (the DSM is an explicit
-read/write API over named segments, read-only on the far side), a distributed
-filesystem, a run queue shared between nodes. Those are the hard 90% of Kerrighed.
+What is **not** here: process migration, write coherence (the far side of a segment is
+read-only, one home per segment), a distributed filesystem, a run queue shared between
+nodes. Those are the hard 90% of Kerrighed.
 
 ## Repository layout
 
@@ -87,6 +89,7 @@ module/krg_taskview.c   the whole kernel side: /dev/krgview (read table, write S
 module/krg_dsm.c        paged shared segments: /dev/krgdsm (alloc/write/read/seal/info)
 user/krgtool.c          local/ serve/ show/ spawn/ kill/ load/ mem/ exec
 user/krgdsm.py          alloc / fill / seal / fetch / stream a named segment
+user/dsmread.c          mmap a segment and read it with plain pointer loads
 user/krgsh.py           cluster shell: free / top / ls / bash (+ nodes, show)
 user/krg-pi.py          distributed pi to N digits, used as the SSI demo workload
 user/krg-crack.py       SHA-256 preimage search, used to measure cluster throughput
@@ -133,6 +136,9 @@ krgdsm fillrange pool 0 65536            # stamp all 65536 pages
 krgdsm seal pool
 krgdsm alloc pool 65536 --cache 64       # on the reader: 64 pages is all it keeps
 krgdsm stream pool 0 65535 10.0.2.2:7801 --verify
+
+# the same segment read as memory: no read() calls, just pointer loads
+dsmread pool 10.0.2.2:7801
 ```
 
 `krgsh` also runs interactively, and reads commands from stdin, so it can be
@@ -248,9 +254,16 @@ Two 2 GiB VMs (`krg11-1` = node 2, home; `krg11-2` = node 3, reader), segment
 | reader: cache | 64 pages = 256 KiB |
 | reader: reads all 256 MiB, three runs | 32.2 / 31.3 / 35.5 MiB/s, 110-125 us/page, **0 content mismatches** |
 | reader: peak resident | **64 pages = 0.2 MiB**; `used` 186 MB -> 184 MB (no growth) |
+| reader: the same 256 MiB through `mmap`, plain pointer loads | 6.7-7.1 s, 35.8-38.0 MiB/s, 1024 page faults, **0 mismatched pages** |
 
 The reader used 256 KiB to read 256 MiB. That is the difference between "the cluster
 reports one big memory" and "a node can use memory that lives on another node".
+
+The last row is the important one for "looks like one machine": `dsmread` binds an fd
+to the segment, `mmap`s it, and then just walks a `const unsigned char *`. Each fault
+for a page that is not here yet is handed to a helper thread, which pulls it from the
+home node and completes the fault. One round trip carries 64 pages, so 65 536 pages cost
+1024 requests, not 65 536.
 
 Batch size matters more than bandwidth. On a 256-page segment, one request per page
 cost 1550-1970 us/page (2.0-2.5 MiB/s); 64 pages per request cost 146-150 us/page
@@ -286,7 +299,7 @@ a time on a modern kernel.
 **krg-mini 是把 Kerrighed 的"单系统映像（SSI）"思路做到最小的一份实现。**
 Kerrighed 是 Linux 2.6 时代的 SSI 集群 —— 一堆机器看起来像一台：一张进程表、一份内存、
 一个调度器，进程还能在线迁移。它随 2.6.30 一起停在了过去。krg-mini 只留下骨架：
-**两个内核模块共 962 行（`krg_taskview.c` 530 + `krg_dsm.c` 432）+ 六个用户态工具 2510 行，
+**两个内核模块共 1256 行（`krg_taskview.c` 530 + `krg_dsm.c` 726）+ 七个用户态工具 2793 行，
 不用打内核补丁**，在 Ubuntu 22.04 的原版内核上直接编译加载。
 
 | 已经能做到 | 怎么做的 |
@@ -324,13 +337,14 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 - [x] **`SPAWN` 的内核初始放置** —— 不指定节点时，由内核挑最闲的节点并做预留（**khz v0.1**）
 - [ ] **普通 `fork` / `exec` 的放置与再平衡** —— 现在只有 `SPAWN` 走内核策略，跑起来的进程不会迁移
 - [x] **按页共享内存** —— `/dev/krgdsm` 命名段：页按需才占内存，`DSMGET` 一次拉 64 页，读端缓存有上限（**khz v0.1**）
-- [ ] **当成内存用** —— 共享地址空间 + 缺页 + 写归属，而不是显式 read/write 调用；现在一个段只有一个 home
+- [x] **当成内存用** —— `mmap` 一个段，用指针直接读；缺页转给 helper 线程去对端取页（**khz v0.1**）
+- [ ] **写一致性** —— 远端只读；没有写归属、没有使失效、一个段只有一个 home
 - [x] 扩到 5 台物理机 + 20 台虚拟机（2026-10-27：5 台宿主各跑 4 台 VM = 20 个节点，物理机只当宿主）
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
 继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
 第三块落地之前，它只能叫**部分 SSI**。
-**没做的**（也就是 Kerrighed 真正难的那 90%）：进程迁移、共享地址空间（共享内存是按页的显式读写接口，
-远端只读，不是把指针指过去）、共享文件系统、跨节点共用一条运行队列。
+**没做的**（也就是 Kerrighed 真正难的那 90%）：进程迁移、写一致性（远端只读、一个段只有一个 home）、
+共享文件系统、跨节点共用一条运行队列。
 这里的 `ls` 只是"同一个路径在每台机器各列一遍"，因为节点之间并没有共享文件系统。
 
 **一大片内存，实测（2026-10-27，两台 2 GiB 虚拟机）**：段 = 65 536 页 = 256 MiB，home 在 node 2。
@@ -340,6 +354,9 @@ home 只占槽位、写一页才占一页，写满后 `used` 220 → 477 MB（+2
 读到不在本地的页返回 `ENODATA`（不是零），往缓存段写返回 `EPERM`（读端副本只读，home 不会被覆盖）。
 批量比网络更值钱：同一个 256 页的段，一页一次请求 1550–1970 µs/页（2.0–2.5 MiB/s），
 一次 64 页 146–150 µs/页（26.1–26.8 MiB/s）。
+
+**同一个 256 MiB 换成 `mmap` 直接指针读**（`dsmread`）：6.7–7.1 s，35.8–38.0 MiB/s，1024 次缺页，内容零错。
+程序里只有 `base[i]`，一次 read() 都没有 —— 缺页交给 helper 线程去 home 节点取，一次往返带 64 页。
 
 实测（2026-10-27，13 个节点 = 1 台物理机 + 12 台虚拟机，Ubuntu 22.04 / 内核 5.15）：
 `krgsh` 一条命令汇总 13 台机器的进程表、内存、目录；`krg-pi --digits 100` 13/13 节点应答、

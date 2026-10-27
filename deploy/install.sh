@@ -27,6 +27,7 @@ install -m 0755 "$HERE/user/krgsh.py"  /usr/local/bin/krgsh
 install -m 0755 "$HERE/user/krg-crack.py" /usr/local/bin/krg-crack
 install -m 0755 "$HERE/user/krg-top.py" /usr/local/bin/krg-top
 install -m 0755 "$HERE/user/krgdsm.py" /usr/local/bin/krgdsm
+install -m 0755 "$HERE/user/dsmread"   /usr/local/bin/dsmread
 install -m 0644 "$HERE/deploy/krg-mini.service" /etc/systemd/system/krg-mini.service
 
 if [ -n "${2:-}" ]; then

@@ -21,7 +21,14 @@
  *     INFO   pages / sealed / cache / resident / pages that came from a peer
  *
  * Still an explicit API: a program asks for bytes. Transparent pointer access
- * needs fault handling and page-level coherence, which is the next step.
+ * is the step on top: ATTACH an fd to a segment, mmap it, and a fault for a
+ * page that is not here yet is handed to a userspace helper, which pulls the
+ * page over the cluster channel and completes the fault. The program just
+ * dereferences memory; it never calls read().
+ *
+ *   KRGDSM_IOC_ATTACH      bind an open fd to a segment (for mmap)
+ *   KRGDSM_IOC_FAULT_WAIT  take one pending fault request (blocking, ~200 ms)
+ *   KRGDSM_IOC_FAULT_DONE  hand the page back (or report a failure)
  */
 #include <linux/module.h>
 #include <linux/miscdevice.h>
@@ -33,6 +40,9 @@
 #include <linux/highmem.h>
 #include <linux/gfp.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
+#include <linux/list.h>
+#include <linux/jiffies.h>
 
 #define KRGDSM_MAX_SEGS		16
 #define KRGDSM_MAX_PAGES	262144	/* 1 GiB of slots, not of memory */
@@ -62,6 +72,18 @@ struct krgdsm_io {
 #define KRGDSM_IOC_SEAL		_IOW(KRGDSM_IOC_MAGIC, 4, struct krgdsm_io)
 #define KRGDSM_IOC_FREE		_IOW(KRGDSM_IOC_MAGIC, 5, struct krgdsm_io)
 #define KRGDSM_IOC_INFO		_IOWR(KRGDSM_IOC_MAGIC, 6, struct krgdsm_io)
+#define KRGDSM_IOC_ATTACH	_IOW(KRGDSM_IOC_MAGIC, 7, struct krgdsm_io)
+#define KRGDSM_IOC_FAULT_WAIT	_IOWR(KRGDSM_IOC_MAGIC, 8, struct krgdsm_io)
+#define KRGDSM_IOC_FAULT_DONE	_IOW(KRGDSM_IOC_MAGIC, 9, struct krgdsm_io)
+
+#define KRGDSM_F_FAULT_ERR	0x2	/* FAULT_DONE: could not fetch */
+#define KRGDSM_FAULT_RETAKE	(15 * HZ)	/* a helper that died */
+
+struct dsm_req {
+	struct list_head node;
+	unsigned page;
+	unsigned long taken_at;	/* 0 = nobody has picked it up */
+};
 
 struct krgdsm_seg {
 	char name[KRGDSM_NAME];
@@ -74,6 +96,12 @@ struct krgdsm_seg {
 	u8 *present;
 	unsigned *fifo;		/* ring of resident page indices, size cache */
 	unsigned head, len;
+	unsigned refs;		/* open fds bound to this segment */
+	unsigned mapped;	/* live vmas */
+	unsigned gen;		/* bumped on every completed fault */
+	struct list_head reqs;	/* pending fault requests */
+	wait_queue_head_t req_wq;
+	wait_queue_head_t done_wq;
 };
 
 static struct krgdsm_seg *segs[KRGDSM_MAX_SEGS];
@@ -119,6 +147,9 @@ static struct krgdsm_seg *alloc_seg(const char *name, unsigned pages,
 	s->name[KRGDSM_NAME - 1] = 0;
 	s->pages = pages;
 	s->cache = cache;
+	INIT_LIST_HEAD(&s->reqs);
+	init_waitqueue_head(&s->req_wq);
+	init_waitqueue_head(&s->done_wq);
 
 	s->pgs = kvcalloc(pages, sizeof(*s->pgs), GFP_KERNEL);
 	s->present = kvcalloc(pages, 1, GFP_KERNEL);
@@ -137,8 +168,13 @@ static struct krgdsm_seg *alloc_seg(const char *name, unsigned pages,
 
 static void free_seg(struct krgdsm_seg *s)
 {
+	struct dsm_req *r, *tmp;
 	unsigned i;
 
+	list_for_each_entry_safe(r, tmp, &s->reqs, node) {
+		list_del(&r->node);
+		kfree(r);
+	}
 	for (i = 0; i < s->pages; i++)
 		if (s->pgs[i])
 			__free_page(s->pgs[i]);
@@ -185,6 +221,8 @@ static int make_room(struct krgdsm_seg *s)
 {
 	if (!s->cache)
 		return 0;
+	if (s->mapped)
+		return -ENOMEM;	/* pages handed to a vma cannot be pulled back */
 	while (s->resident >= s->cache && s->len) {
 		drop_page(s, s->fifo[s->head]);
 		s->head = (s->head + 1) % s->cache;
@@ -322,6 +360,10 @@ static int dsm_free(struct krgdsm_io *io)
 	mutex_lock(&dsm_lock);
 	for (i = 0; i < KRGDSM_MAX_SEGS; i++) {
 		if (segs[i] && !strncmp(segs[i]->name, io->name, KRGDSM_NAME)) {
+			if (segs[i]->refs || segs[i]->mapped) {
+				ret = -EBUSY;
+				break;
+			}
 			free_seg(segs[i]);
 			segs[i] = NULL;
 			ret = 0;
@@ -330,6 +372,244 @@ static int dsm_free(struct krgdsm_io *io)
 	}
 	mutex_unlock(&dsm_lock);
 	return ret;
+}
+
+/* ---- fault forwarding: a page the vma wants is not here yet -------------- */
+
+static struct dsm_req *find_req(struct krgdsm_seg *s, unsigned page)
+{
+	struct dsm_req *r;
+
+	list_for_each_entry(r, &s->reqs, node)
+		if (r->page == page)
+			return r;
+	return NULL;
+}
+
+static void add_req(struct krgdsm_seg *s, unsigned page)
+{
+	struct dsm_req *r = kmalloc(sizeof(*r), GFP_KERNEL);
+
+	if (!r)
+		return;
+	r->page = page;
+	r->taken_at = 0;
+	list_add_tail(&r->node, &s->reqs);
+}
+
+static int dsm_attach(struct file *fp, struct krgdsm_io *io)
+{
+	struct krgdsm_seg *s;
+
+	if (fp->private_data)
+		return -EBUSY;
+	mutex_lock(&dsm_lock);
+	s = find_seg(io->name);
+	if (s)
+		s->refs++;
+	mutex_unlock(&dsm_lock);
+	if (!s)
+		return -ENOENT;
+	fp->private_data = s;
+	return 0;
+}
+
+static int dsm_release(struct inode *ino, struct file *fp)
+{
+	struct krgdsm_seg *s = fp->private_data;
+
+	if (s) {
+		mutex_lock(&dsm_lock);
+		if (s->refs)
+			s->refs--;
+		mutex_unlock(&dsm_lock);
+		fp->private_data = NULL;
+	}
+	return 0;
+}
+
+/* misc_open() stuffs the struct miscdevice into private_data; we want it
+ * empty so that ATTACH can put a segment there. */
+static int dsm_open(struct inode *ino, struct file *fp)
+{
+	fp->private_data = NULL;
+	return 0;
+}
+
+/* helper side: take one request, or time out so the helper can check a flag */
+static int dsm_fault_wait(struct krgdsm_io *io)
+{
+	struct krgdsm_seg *s;
+	struct dsm_req *r;
+	int ret;
+
+	/* never sleep with dsm_lock held: the fault side needs it to post */
+	for (;;) {
+		mutex_lock(&dsm_lock);
+		s = find_seg(io->name);
+		if (!s) {
+			mutex_unlock(&dsm_lock);
+			return -ENOENT;
+		}
+		list_for_each_entry(r, &s->reqs, node) {
+			int free_slot = !r->taken_at ||
+				time_after(jiffies,
+					   r->taken_at + KRGDSM_FAULT_RETAKE);
+
+			if (!free_slot)
+				continue;
+			r->taken_at = jiffies ? jiffies : 1;
+			io->page = r->page;
+			mutex_unlock(&dsm_lock);
+			return 0;
+		}
+		mutex_unlock(&dsm_lock);
+
+		ret = wait_event_interruptible_timeout(s->req_wq,
+						       !list_empty(&s->reqs),
+						       HZ / 5);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return -EAGAIN;
+	}
+}
+
+/* helper side: the page (or a failure) comes back */
+static int dsm_fault_done(struct krgdsm_io *io)
+{
+	struct krgdsm_seg *s;
+	struct dsm_req *r;
+	struct page *pg;
+	char *kaddr;
+	int ret = -ENOENT;
+
+	mutex_lock(&dsm_lock);
+	s = find_seg(io->name);
+	if (!s)
+		goto out;
+	if (io->page >= s->pages) {
+		ret = -EINVAL;
+		goto out;
+	}
+	r = find_req(s, io->page);
+	if (!r) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	if (!(io->flags & KRGDSM_F_FAULT_ERR) && !s->pgs[io->page]) {
+		pg = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!pg) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		kaddr = kmap_local_page(pg);
+		if (copy_from_user(kaddr, (void __user *)(uintptr_t)io->buf,
+				   min_t(unsigned, io->len, PAGE_SIZE))) {
+			kunmap_local(kaddr);
+			__free_page(pg);
+			ret = -EFAULT;
+			goto out;
+		}
+		kunmap_local(kaddr);
+		s->pgs[io->page] = pg;
+		s->resident++;
+	}
+	if (!(io->flags & KRGDSM_F_FAULT_ERR))
+		s->present[io->page] = 1;
+
+	list_del(&r->node);
+	kfree(r);
+	s->gen++;
+	wake_up_all(&s->done_wq);
+	ret = 0;
+out:
+	mutex_unlock(&dsm_lock);
+	return ret;
+}
+
+static vm_fault_t dsm_vm_fault(struct vm_fault *vmf)
+{
+	struct krgdsm_seg *s = vmf->vma->vm_file->private_data;
+	unsigned idx = vmf->pgoff;
+	unsigned gen;
+	int i;
+
+	if (!s || idx >= s->pages)
+		return VM_FAULT_SIGBUS;
+
+	for (i = 0; i < 300; i++) {		/* ~30 s, then give up */
+		struct page *pg = NULL;
+
+		mutex_lock(&dsm_lock);
+		if (s->present[idx] && s->pgs[idx]) {
+			pg = s->pgs[idx];
+			get_page(pg);
+			mutex_unlock(&dsm_lock);
+			vmf->page = pg;
+			return 0;
+		}
+		if (!find_req(s, idx)) {
+			add_req(s, idx);
+			wake_up_all(&s->req_wq);
+		}
+		gen = s->gen;
+		mutex_unlock(&dsm_lock);
+
+		if (wait_event_interruptible_timeout(s->done_wq, s->gen != gen,
+						     HZ / 10) < 0)
+			return VM_FAULT_SIGBUS;
+	}
+	return VM_FAULT_SIGBUS;
+}
+
+static void dsm_vm_open(struct vm_area_struct *vma)
+{
+	struct krgdsm_seg *s = vma->vm_file->private_data;
+
+	mutex_lock(&dsm_lock);
+	if (s) {
+		s->mapped++;
+		try_module_get(THIS_MODULE);
+	}
+	mutex_unlock(&dsm_lock);
+}
+
+static void dsm_vm_close(struct vm_area_struct *vma)
+{
+	struct krgdsm_seg *s = vma->vm_file->private_data;
+
+	mutex_lock(&dsm_lock);
+	if (s && s->mapped)
+		s->mapped--;
+	mutex_unlock(&dsm_lock);
+	module_put(THIS_MODULE);
+}
+
+static const struct vm_operations_struct dsm_vm_ops = {
+	.open	= dsm_vm_open,
+	.close	= dsm_vm_close,
+	.fault	= dsm_vm_fault,
+};
+
+static int dsm_mmap(struct file *fp, struct vm_area_struct *vma)
+{
+	struct krgdsm_seg *s = fp->private_data;
+	unsigned long n;
+
+	if (!s)
+		return -EINVAL;
+	if (vma->vm_pgoff >= s->pages)
+		return -EINVAL;
+	n = vma->vm_end - vma->vm_start;
+	if (vma->vm_pgoff + (n >> PAGE_SHIFT) > s->pages)
+		return -EINVAL;
+
+	vma->vm_ops = &dsm_vm_ops;
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	dsm_vm_open(vma);
+	return 0;
 }
 
 static int dsm_info(struct krgdsm_io *io)
@@ -385,6 +665,17 @@ static long dsm_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 		if (copy_to_user((void __user *)arg, &io, sizeof(io)))
 			return -EFAULT;
 		return 0;
+	case KRGDSM_IOC_ATTACH:
+		return dsm_attach(fp, &io);
+	case KRGDSM_IOC_FAULT_WAIT:
+		ret = dsm_fault_wait(&io);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &io, sizeof(io)))
+			return -EFAULT;
+		return 0;
+	case KRGDSM_IOC_FAULT_DONE:
+		return dsm_fault_done(&io);
 	default:
 		return -ENOTTY;
 	}
@@ -392,7 +683,10 @@ static long dsm_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 
 static const struct file_operations dsm_fops = {
 	.owner = THIS_MODULE,
+	.open = dsm_open,
 	.unlocked_ioctl = dsm_ioctl,
+	.mmap = dsm_mmap,
+	.release = dsm_release,
 	.llseek = noop_llseek,
 };
 
