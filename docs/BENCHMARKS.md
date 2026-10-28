@@ -355,3 +355,46 @@ python3 raw_sha.py 48 20000000
 The screenshot needs no scrubbing: node names are `<host>-<slot>`, and the page shows
 no addresses. Everything else in this document is the same — no hostnames, no IPs,
 no credentials.
+
+## Kernel swap: 5.15 -> our own 5.1 (2026-10-28, 40 nodes)
+
+Same five hosts, same 40 guests, same image, same workload as the section above. The
+only change: every guest was rebuilt on **5.1.0 #1 SMP**, the kernel we compile
+ourselves (`RETPOLINE=n`, everything built in, no initramfs; `krg_taskview.ko` is
+loaded out-of-tree by `insmod`). 5.1 is the last tree upstream Kerrighed supported,
+so this is also the tree the port is moving to.
+
+| kernel | runs (MHash/s) | median | per vCPU | wall, 2 G |
+|---|---|---|---|---|
+| 5.15.0-198 stock | 49.1 / 49.2 / 49.5 | **49.2** | 0.615 | 40.67 s |
+| **5.1.0 ours** | 49.0 / 48.8 / 48.9 / 49.4 / 49.2 | **49.0** | 0.613 | 40.86 s |
+
+- **0.996x — no measurable cost.** The gap (0.4 %) is smaller than the run-to-run
+  spread within either day (0.8 % and 1.2 %), so it is the same number twice.
+- Every run printed `workers 80 on 40 nodes`; no `unreachable`, no `no progress`.
+- Scope: this is a **user-space** SHA-256 workload pushed through `krgtool`. It says
+  nothing about syscall-, fork- or memory-heavy work on 5.1, and nothing about
+  kernel-side SSI features.
+- Void run set, kept for honesty: the first attempt used `--zeros 7` instead of 12, so
+  the search hit in ~8 s and printed 46.1 / 42.4 / 43.4 MHash/s — startup-contaminated,
+  not steady state. Discarded, not averaged in.
+- Small end: 2 nodes / 4 workers, 100 M hashes in 42.64 s = 2.3 MHash/s (0.586 per
+  vCPU) — 4.4 % under the 40-node per-vCPU figure, which is what 4 processes instead
+  of 80 should cost in latency hiding.
+
+![40-node cluster on kernel 5.1.0, mid-run: 40/40 nodes, 80 cores at 99.9 % CPU, 80
+workers](images/krg-top-40nodes-5.1-underload.png)
+
+`krg-top` 27 s into a 2 G-hash run on the new kernel: header `cpu 99.9 %`, `workers 80`,
+`mem 5.1 / 68.1 GiB`; every one of the 40 cards reads `cpu 2 cores 99.7-100.0 %`,
+`krg-crack workers 2`, `5.1.0`. Full write-up: `REPORT_2026-10-28_5.1-kernel-40nodes.md`.
+
+### Reproducing
+
+```sh
+# on every guest: /boot/vmlinuz-5.1.0-krg + insmod krg_taskview, then reboot
+uname -r                                            # 5.1.0
+lsmod | grep krg_taskview                           # one 5.1-built module
+# coordinator: exactly the same command as the 5.15 run
+krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-per-node 2
+```

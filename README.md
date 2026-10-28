@@ -229,6 +229,13 @@ amount of work so a lucky hit cannot flatter the number.
   one socket pair**, not SSI magic: the same conclusion the 20-node round reached,
   now at twice the size.
 
+- **Swapping the kernel underneath costs nothing.** All 40 guests were then rebuilt
+  from 5.15 to **our own 5.1.0** (`RETPOLINE=n`, everything built in, no initramfs) -
+  5.1 being the tree upstream Kerrighed last supported. Same hosts, same workload:
+  **49.0 MHash/s** (median of 5 runs) against 49.2 (median of 3) on the stock kernel,
+  **0.996x**; per vCPU 0.613 vs 0.615. The run-to-run spread is wider than the gap,
+  so this is the same number measured twice rather than a slowdown.
+
 | | 20 nodes | 40 nodes | ratio |
 |---|---|---|---|
 | vCPU | 40 | 80 | 2.00x |
@@ -240,10 +247,15 @@ amount of work so a lucky hit cannot flatter the number.
 ![20-node cluster under full load](docs/images/krg-top-20nodes.png)
 
 ![40-node cluster under full load](docs/images/krg-top-40nodes.png)
+
+![40-node cluster on kernel 5.1.0, mid-run](docs/images/krg-top-40nodes-5.1-underload.png)
+*Same 40 guests after the kernel swap: 27 s into a 2 G-hash run, `cpu 99.9 %`,
+`workers 80`, every card `5.1.0` with 2 workers on 2 cores.*
+
 Full environment, per-node numbers and the exact commands are in
 `docs/BENCHMARKS.md`; the two benchmark rounds have their own write-ups,
-`docs/REPORT_2026-10-27_20nodes.md` and `docs/REPORT_2026-10-27_40nodes.md`.
-
+`docs/REPORT_2026-10-27_20nodes.md` and `docs/REPORT_2026-10-27_40nodes.md`; the
+kernel-swap round is `docs/REPORT_2026-10-28_5.1-kernel-40nodes.md`.
 ## Measured: shared memory (2026-10-27)
 
 Two 2 GiB VMs (`krg11-1` = node 2, home; `krg11-2` = node 3, reader), segment
