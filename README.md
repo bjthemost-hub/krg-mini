@@ -59,6 +59,8 @@ out of scope for v0.1. Criteria: [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-
 - [x] **DSM as memory** — `mmap` a segment and dereference it; faults are forwarded to a helper that fetches the page (**khz v0.1**)
 - [ ] **write coherence** — the far side of a segment is read-only; no write ownership, no invalidation, one home per segment
 - [x] scale out to 5 physical hosts + 20 VMs (4 VMs per host, physical boxes are hosts only)
+- [x] **boots on a vanilla Linux 5.1** — `x86_64_defconfig`, `RETPOLINE=n`, `STACK_VALIDATION=n`; GRUB loads it with no initramfs (`root=/dev/sda1`), and `krg_taskview.ko` needed no source change (2026-10-28)
+- [x] **40 VMs, all on that 5.1 build** (5 hosts x 8) — one merged process table, `free` / `top` summed over 40 nodes, 40/40 reachable (2026-10-28)
 The next three steps, in order: a shared `/krg` (NFS first, so paths and bytes
 agree), then a process tree that spans nodes (remote fork with fd/pipe objects
 forwarded), then a paged DSM. Until the last one lands, this is honest to call a
@@ -279,6 +281,12 @@ A teaching prototype. It is honest about what it does, small enough to read in a
 afternoon, and a reasonable starting point if you want to grow one SSI feature at
 a time on a modern kernel.
 
+What it runs on has moved too. As of 2026-10-28 the module is built against a vanilla
+**Linux 5.1** (`x86_64_defconfig`, `RETPOLINE=n`, `STACK_VALIDATION=n`) and that kernel is
+what 40 VMs boot from GRUB: no initramfs, `root=/dev/sda1`, SATA and NIC built in.
+See `deploy/kernel51-setup.sh`. It is a build that boots and runs the same code, not a
+feature port — none of the SSI properties below got better because of it.
+
 ## 中文简介
 
 **一眼看结果（2026-10-27 实测，同一个负载：SHA-256 原像搜索）**
@@ -324,6 +332,9 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 每条都带一个别人能重跑的验收测试；**单一文件系统明确不在 v0.1 范围内**。
 逐条判定依据与验收标准写在 [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-MACHINE.md)。
 
+**它跑的内核也换了。** 2026-10-28 起，模块编译在原生 **Linux 5.1** 上（`x86_64_defconfig`、`RETPOLINE=n`、`STACK_VALIDATION=n`），`krg_taskview.ko` 的源码一行没改；40 台虚拟机都由 GRUB 直接引导这个内核，不带 initramfs，`root=/dev/sda1`，SATA 和网卡驱动编进内核。部署脚本见 `deploy/kernel51-setup.sh`。
+要说明白：这是**换了个能引导、能跑同一份代码的内核**，不是功能移植 —— 下面那些 SSI 属性一条都没有因为这个变好。
+
 ## 协作板 / Bulletin board
 
 有一个公开的协作板，记录内核改造的进展、方案评审和待决项：
@@ -347,6 +358,8 @@ An open bulletin board tracks kernel work in progress, design reviews and open q
 - [x] **当成内存用** —— `mmap` 一个段，用指针直接读；缺页转给 helper 线程去对端取页（**khz v0.1**）
 - [ ] **写一致性** —— 远端只读；没有写归属、没有使失效、一个段只有一个 home
 - [x] 扩到 5 台物理机 + 20 台虚拟机（2026-10-27：5 台宿主各跑 4 台 VM = 20 个节点，物理机只当宿主）
+- [x] **跑在原生 Linux 5.1 上**（2026-10-28）—— `x86_64_defconfig` + `RETPOLINE=n` + `STACK_VALIDATION=n` 编出的 bzImage，由 GRUB 直接引导、不带 initramfs（`root=/dev/sda1`）；`krg_taskview.ko` 源码一行没改就加载成功
+- [x] **扩到 40 台虚拟机、全部跑 5.1 内核**（5 宿主 x 8）—— 进程表合并、`free` / `top` 按 40 个节点汇总，40/40 可达（2026-10-28）
 接下来三步：先 `/krg` 共享（先上 NFS，让路径和数据一致），再做跨节点的进程树（远程 fork，
 继承的 fd / 管道 / socket 这些对象要自己转发，不能在远端按路径重新 open），最后才是按页拉取的 DSM。
 第三块落地之前，它只能叫**部分 SSI**。

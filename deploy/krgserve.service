@@ -1,0 +1,12 @@
+[Unit]
+Description=khz: krgtool serve 7700
+DefaultDependencies=no
+After=krgcheck.service
+Requires=krgcheck.service
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/krgtool serve 7700
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=sysinit.target

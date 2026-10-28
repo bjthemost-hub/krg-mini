@@ -1,0 +1,11 @@
+[Unit]
+Description=khz: insmod krg_taskview with node id
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'NID=$(cat /etc/krg-node-id); /sbin/insmod /lib/modules/5.1.0/kernel/krg_taskview.ko node_id=$NID'
+[Install]
+WantedBy=sysinit.target

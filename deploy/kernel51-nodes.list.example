@@ -1,0 +1,6 @@
+# One line per node:  <hostname as the node reports it>  <host:port of its krgtool serve>
+# The host:port must be reachable from every other node. If your VMs sit behind
+# NAT, that is the NAT host address plus the forwarded port.
+node01 10.0.0.11:7801
+node02 10.0.0.11:7802
+node03 10.0.0.12:7801

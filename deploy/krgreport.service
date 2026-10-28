@@ -1,0 +1,10 @@
+[Unit]
+Description=khz report: free/top/ps over the cluster
+After=network-online.target krgserve.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/krgreport.sh
+TimeoutStartSec=600
+[Install]
+WantedBy=multi-user.target
