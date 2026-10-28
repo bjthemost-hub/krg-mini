@@ -4,6 +4,45 @@
 > (OpenAI Codex) and a human maintainer; every change was compiled, installed and
 > measured on real machines. See [AI disclosure](#ai-disclosure).
 
+## Current status / 当前进度 (2026-10-28)
+
+**40 nodes already run as one machine. What is left this round is making a *fresh* machine
+become a node at install time — no manual kernel swap afterwards.**
+
+Working today: 40 nodes share one process table — `/dev/krgview` exports each node's task list,
+`krgtool show` merges them, and every task carries a global pid `node_id << 24 | pid`, so `ps`
+and `kill` reach any task from any node. `krg_rpc` spawns on a remote node and returns its gpid,
+kills it from another node (both PASS), and a `spawn` with no target is placed by the kernel on
+the idlest node. `krg-top` / `krgsh` sum `nproc` and CPU% across every node. Same SHA-256 workload,
+one box vs the cluster: 109.87 s vs 40.86 s — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+This round is the install path: an ISO that installs kernel 5.1 plus a ready krg node
+(node 41, port 7901) in one pass. The first attempt did not: the machine came up on the stock
+5.15 kernel with nothing from krg. **Root cause in one sentence**: `/autoinstall` and `/krg` were
+written into the Joliet namespace only — Linux mounts the disc through Rock Ridge, where those
+directories did not exist, so autoinstall never found its seed, the installer quietly fell back
+to a manual install, and its `late-commands` (the step that installs the 5.1 kernel and the
+modules) never ran. The build script was not at fault.
+
+Next: write every directory into all three namespaces (`iso_path` + `rr_name` + `joliet_path`)
+and read all three back from the finished image instead of trusting that it built; make the
+late-command log land in `/target/root/` instead of the live environment's `/tmp`, drop an
+"executed" marker at the start, and report a line number on failure.
+**Acceptance criteria** (not results yet) on a freshly installed machine: `uname -r` is
+`5.1.0-krg`, `lsmod` lists the krg module, `/dev/krgview` exists, `/etc/krg-node-id` is `41`.
+
+**中文**：40 节点已经公用一张进程表 —— `/dev/krgview` 导出各节点任务表，`krgtool show` 合并，
+全局 pid = `节点号 << 24 | pid`，任意节点 `ps` / `kill` 都能碰到；`krg_rpc` 跨节点 spawn 拿 gpid、
+跨节点 kill 全部 PASS，不指定目标时由内核挑最闲节点；`krg-top` / `krgsh` 把各节点 `nproc` 与 CPU% 加起来显示。
+同一负载单机 40 进程 109.87 s、40 节点 40.86 s（见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)）。
+这一轮做的是装机 ISO：一次装完就是 5.1 内核 + 一个能用的 krg 节点（第 41 号节点，端口 7901）。
+第一版没成：装完起来是原版 5.15，krg 一样都没有。**根因一句话**：`/autoinstall` 与 `/krg`
+只写进了 Joliet 命名空间，Linux 挂盘走 Rock Ridge、看不到这两个目录 → autoinstall 找不到 seed、
+安装器退化成手动安装 → `late-commands` 从未执行（装内核和模块就是这一步）—— 不是 build 脚本的问题。
+下一步：三个命名空间同时写并读回逐一核对；`late-commands` 日志改写到 `/target/root/`、开头落“已执行”标记、
+失败留行号。**验收口径**（是判据、不是结果）：新装机器 `uname -r` = `5.1.0-krg`、`lsmod` 有 krg 模块、
+`/dev/krgview` 存在、`/etc/krg-node-id` = 41。
+
 ## At a glance — cluster vs one box (measured 2026-10-27)
 
 | setup | compute it uses | throughput | per unit |
