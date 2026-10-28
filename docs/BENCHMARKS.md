@@ -398,3 +398,53 @@ lsmod | grep krg_taskview                           # one 5.1-built module
 # coordinator: exactly the same command as the 5.15 run
 krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-per-node 2
 ```
+
+## One box vs 40 nodes, measured the same hour (2026-10-28)
+
+The scaling tables above compare against a baseline taken the previous day. This is the
+same comparison with both sides measured inside the same hour, on the kernel the cluster
+now runs.
+
+**The box** is `nd20` - one of the five hosts, 2x12-core Xeon E5-2650 v4 (24 physical
+cores, 48 threads, SMT on), its own 8 guests idle. It is **not** a 40-core machine: 40
+processes already oversubscribe 24 physical cores. `raw_sha.py`, the same
+`hashlib.sha256(...).hexdigest()` inner loop, plain `fork()`, no cluster layer.
+
+| work | processes | runs | wall | rate | per process |
+|---|---|---|---|---|---|
+| 800 M (40 x 20 M) | 40 | 3 | 43.24 / 43.49 / 44.45 s | 18.5 / 18.4 / 18.0 | 0.460 (median) |
+| **2.00 G (40 x 50 M)** | 40 | 1 | **109.87 s** | **18.2** | 0.455 |
+
+**The cluster**, same 2 G of work, five runs today on 5.1.0: median **40.86 s / 49.0
+MHash/s** (per vCPU 0.613).
+
+| | one box, 40 procs | 40 nodes, 80 vCPU | ratio |
+|---|---|---|---|
+| wall for 2 G hashes | 109.87 s | 40.86 s | **2.69x faster** |
+| throughput | 18.2 MHash/s | 49.0 MHash/s | **2.69x** |
+| per unit | 0.455 per process | 0.613 per vCPU | **1.35x** |
+| silicon it draws on | 24 cores / 48 threads | 5 hosts x 24 cores = 120 cores (80 vCPU used) | |
+
+Three things this table is and is not:
+
+- **It is same-hour, same-code, same-workload.** Both sides ran the identical SHA-256 loop
+  over the identical 2 G-hash budget, one hour apart, on the same machines.
+- **It is not one box vs one box.** The cluster's 80 vCPU are drawn from five physical
+  hosts; that is the whole point of a cluster, and it is also why the ratio is ~2.7x rather
+  than ~5x - per vCPU the cluster is only 1.35x the box, the rest of the gap is the box
+  being oversubscribed (40 processes on 24 cores, 0.455 each against the 0.813 it gets
+  with 20 processes).
+- **It is not 40 physical cores on either side.** No machine here has 40 cores. If you
+  want that comparison you need a 40-core box and the number goes somewhere else; the
+  arithmetic from 0.46-0.47 per process says ~18.5 MHash/s at 40 processes regardless of
+  whether they sit on 24 cores or 40, because CPython's SHA-256 saturates per core.
+
+### Reproducing
+
+```sh
+# one box, the exact cluster workload size
+python3 raw_sha.py 40 50000000        # 2.00 G hashes, 40 processes
+
+# the cluster, same budget
+krg-crack --zeros 12 --budget 2000000000 --nodes /etc/krg-nodes.list --workers-per-node 2
+```

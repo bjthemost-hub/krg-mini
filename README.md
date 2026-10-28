@@ -236,6 +236,11 @@ amount of work so a lucky hit cannot flatter the number.
   **0.996x**; per vCPU 0.613 vs 0.615. The run-to-run spread is wider than the gap,
   so this is the same number measured twice rather than a slowdown.
 
+- **One box vs 40 nodes, measured in the same hour (2026-10-28).** 40 processes on a single
+  host (24 cores / 48 threads, so already oversubscribed) hash 2.00 G nonces in 109.87 s =
+  18.2 MHash/s; the 40-node cluster does the same 2 G of work in 40.86 s = 49.0 MHash/s,
+  i.e. **2.69x faster** and **1.35x per vCPU**. No machine here has 40 physical cores - the
+  box is 24 cores with SMT, which is why it loses per process (0.455) rather than per core.
 | | 20 nodes | 40 nodes | ratio |
 |---|---|---|---|
 | vCPU | 40 | 80 | 2.00x |
