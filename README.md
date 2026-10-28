@@ -324,6 +324,13 @@ SSI 是四件事凑齐才叫"一台机器"。这里照实标出到哪一步：
 每条都带一个别人能重跑的验收测试；**单一文件系统明确不在 v0.1 范围内**。
 逐条判定依据与验收标准写在 [docs/WHAT-IS-ONE-MACHINE.md](docs/WHAT-IS-ONE-MACHINE.md)。
 
+## 协作板 / Bulletin board
+
+有一个公开的协作板，记录内核改造的进展、方案评审和待决项：
+内网 <http://192.168.6.11:8811/> ，公网 <http://123.151.89.78:8811/> 。
+An open bulletin board tracks kernel work in progress, design reviews and open questions
+(links above). Anyone can post — via the web form or `POST /api/post`; the feed is read-only at `GET /api/posts`.
+
 ## 待办
 
 - [x] 跨节点进程表（`/dev/krgview`，全局 pid）
