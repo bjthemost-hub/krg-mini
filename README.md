@@ -123,6 +123,32 @@ What is **not** here: process migration, write coherence (the far side of a segm
 read-only, one home per segment), a distributed filesystem, a run queue shared between
 nodes. Those are the hard 90% of Kerrighed.
 
+### Distance to running a compiler on the cluster
+
+`gcc x.c` is not one process: driver → `cc1` → `as` → `collect2` → `ld`, with pipes,
+temp files and exit codes in between. Running that here needs four things this project
+does not have yet:
+
+| # | requirement | today |
+|---|---|---|
+| R1 | a process tree that spans nodes — parent/child, pipes, `SIGINT` to the whole tree, exit status back | only `SPAWN` / `KILL` of a single task; `fork` never crosses a node |
+| R2 | one view of the bytes — `cc1` writes `.s`, `as` writes `.o`, `ld` reads both, possibly on different machines | each node has its own filesystem; `krgsh ls` lists every node separately |
+| R3 | writable memory — `cc1` at `-O2` wants hundreds of MB to GB of heap, heavily mmapped | the far side of a DSM segment is read-only; one home per segment |
+| R4 | faults must not dominate — one remote page costs 110–150 µs (measured, 64-page batches); a local fault is sub-microsecond | nothing beyond the 64-page batch, no migration |
+
+Milestones, each with a check anyone can rerun:
+
+- **M1 cross-node process tree** — a two-stage pipeline lands on two nodes; `Ctrl-C` stops the whole tree; the exit code comes back.
+- **M2 one view of the bytes** — a file written on A reads back on B at the same path, same offset, same bytes (NFS first); `.s` / `.o` live in that tree.
+- **M3 write coherence** — write ownership, single writer, acquire/release, write-back and eviction; check: two nodes alternate writes to one segment, read back identical bytes.
+- **M4 fault cost** — either compress remote faults, or move the process instead: migrate `cc1` to the node that has the memory and let every fault be local.
+- **M5 `gcc` end to end** — `hello.c` through cpp/cc1/as/ld across at least two nodes, and the binary runs; then `-j4` on a mid-size project, output identical to one node.
+
+No dates. M1 and M2 are greenfield engineering, M3 is protocol correctness, M4 is
+performance, M5 is the acceptance test. The UDP transport and the global-pid scheme
+carry over to M1/M2; M3 has to be written from scratch, and it is the line between
+"a cluster that runs things" and "an SSI".
+
 ## Repository layout
 
 ```
@@ -422,6 +448,30 @@ An open bulletin board tracks kernel work in progress, design reviews and open q
 **没做的**（也就是 Kerrighed 真正难的那 90%）：进程迁移、写一致性（远端只读、一个段只有一个 home）、
 共享文件系统、跨节点共用一条运行队列。
 这里的 `ls` 只是"同一个路径在每台机器各列一遍"，因为节点之间并没有共享文件系统。
+
+### 离"在这套集群上跑 GCC"还有多远
+
+`gcc x.c` 不是一个进程：driver → `cc1` → `as` → `collect2` → `ld`，中间还有管道、临时文件、
+退出码。要在这套集群上跑通，还差四样：
+
+| 编号 | 要什么 | 现在 |
+|---|---|---|
+| R1 | 跨节点的进程树 —— 父子、管道、`Ctrl-C` 停整棵、退出码回传 | 只有 `SPAWN` / `KILL` 单进程；`fork` 从不跨节点 |
+| R2 | 同一份字节 —— `cc1` 写 `.s`、`as` 写 `.o`、`ld` 读它们，可能不在同一台 | 每台各一份文件系统；`krgsh ls` 只是各列一遍 |
+| R3 | 能写的大内存 —— `cc1` 在 `-O2` 要几百 MB 到 GB 堆，且大量 mmap | 段的对端只读；一个段只有一个 home |
+| R4 | 缺页不能占主导 —— 远端一页 110–150 µs（实测，64 页批量摊薄），本地缺页亚微秒 | 除 64 页批量外没有预取，没有迁移 |
+
+里程碑，每条都带一个别人能重跑的判据：
+
+- **M1 跨节点进程树** —— 一条两段式管道落在两个节点；`Ctrl-C` 停整棵树；退出码回传。
+- **M2 同一份字节** —— A 上写的文件，B 上同路径、同偏移、同样内容（先上 NFS）；`.s` / `.o` 落在这棵树里。
+- **M3 可写共享内存** —— 写归属、单写者、acquire/release、回写与淘汰；判据：两节点交替写同一段，读回一致。
+- **M4 缺页代价** —— 要么把远端缺页压下来，要么换一种做法：把 `cc1` 迁到内存多的那台，让每次缺页都变本地。
+- **M5 GCC 全链路** —— `hello.c` 走 cpp/cc1/as/ld 至少跨两台，产物能跑；再 `-j4` 编一个中等项目，结果与单机一致。
+
+不给日期。M1、M2 是从零到有的工程量，M3 是协议正确性，M4 是性能，M5 才是验收。
+现在这套 UDP 通道与全局 pid 能接到 M1/M2 上；M3 得新写，而且它就是
+"能跑东西的集群"和"SSI"之间的那条线。
 
 **一大片内存，实测（2026-10-27，两台 2 GiB 虚拟机）**：段 = 65 536 页 = 256 MiB，home 在 node 2。
 home 只占槽位、写一页才占一页，写满后 `used` 220 → 477 MB（+257 MB）。读端 `--cache 64`（256 KiB），
